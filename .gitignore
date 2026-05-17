@@ -1,0 +1,24 @@
+cd ~/turboquant-svd
+
+cat > .gitignore <<'EOF'
+__pycache__/
+*.pyc
+*.so
+*.o
+*.pt
+*.pth
+*.safetensors
+
+runs/
+profiles/
+cache/
+output/
+eval_results/
+
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+
+.vscode/
+.idea/
+EOF
