@@ -1,0 +1,1096 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import statistics
+import sys
+import time
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from turboquant import (
+    dense_fp32_logits,
+    encode_turboquant_prod_keys,
+    fit_lloyd_scalar_codebook,
+    make_gaussian_sketch,
+    make_random_orthogonal_rotation,
+    qjl_project_query,
+    rotate,
+    turboquant_prod_reference_logits,
+)
+from turboquant.factor_lut import build_scalar_factor_lut_fp32
+from turboquant.qjl_sign_layout import pack_qjl_signs_lane_nibble
+from turboquant.real_qk_capture import capture_llama_style_qk
+from turboquant.scalar_lane_layout import pack_scalar_codes_lane_word_4bit
+from turboquant.turboquant_combined_reduction_nonfactor_ablation_cuda import (
+    turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_cuda,
+)
+from turboquant.turboquant_factor_lut_combined_reduction_full_cuda import (
+    turboquant_factor_lut_combined_reduction_4bit_qjl128_logits_b1q1_d128_cuda,
+)
+from turboquant.turboquant_logits_baseline_cuda import dense_fp32_qkt_b1q1_d128_cuda
+
+
+DEFAULT_TEXT = (
+    "This deterministic prompt is repeated to benchmark end-to-end decoding for "
+    "an SVD-compressed Llama-style model. The same model is then used to capture "
+    "real decoder-layer Q/K activations and validate optimized TurboQuant decode "
+    "attention logits against dense and PyTorch reference computations. "
+)
+
+DEFAULT_UNIFORM_TARGET_LINEAR_REGEX = (
+    r"^model\.layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|"
+    r"mlp\.(?:gate_proj|up_proj|down_proj))$"
+)
+
+
+def parse_dtype(name: str) -> torch.dtype:
+    name = str(name).lower()
+    if name in {"fp16", "float16", "half"}:
+        return torch.float16
+    if name in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if name in {"fp32", "float32"}:
+        return torch.float32
+    raise ValueError(f"Unsupported dtype: {name}")
+
+
+def percentile_nearest(values: list[float], q: float) -> float:
+    if not values:
+        raise ValueError("Cannot take percentile of empty values.")
+    vals = sorted(float(v) for v in values)
+    if q <= 0:
+        return vals[0]
+    if q >= 1:
+        return vals[-1]
+    idx = round((len(vals) - 1) * q)
+    return vals[int(idx)]
+
+
+def summarize_samples(samples: list[float]) -> dict[str, Any]:
+    vals = [float(x) for x in samples]
+    if not vals:
+        raise ValueError("samples must be non-empty.")
+    return {
+        "samples": vals,
+        "min": float(min(vals)),
+        "p25": float(percentile_nearest(vals, 0.25)),
+        "median": float(statistics.median(vals)),
+        "p75": float(percentile_nearest(vals, 0.75)),
+        "max": float(max(vals)),
+        "mean": float(statistics.fmean(vals)),
+    }
+
+
+def sync() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def ensure_tokenizer_padding(tokenizer) -> None:
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+
+def build_repeated_prompt_ids(
+    tokenizer,
+    *,
+    prompt_len: int,
+    batch_size: int,
+    text: str,
+    device: torch.device,
+) -> torch.Tensor:
+    if int(prompt_len) <= 0:
+        raise ValueError("prompt_len must be positive.")
+    ids = tokenizer(text, add_special_tokens=True, return_tensors="pt").input_ids[0]
+    if ids.numel() == 0:
+        raise RuntimeError("Tokenizer returned zero tokens.")
+
+    chunks = []
+    total = 0
+    while total < int(prompt_len):
+        chunks.append(ids)
+        total += int(ids.numel())
+
+    one = torch.cat(chunks, dim=0)[: int(prompt_len)].view(1, -1)
+    batch = one.repeat(int(batch_size), 1)
+    return batch.to(device=device, dtype=torch.long)
+
+
+def error_metrics(x: torch.Tensor, y: torch.Tensor) -> dict[str, float]:
+    diff = x.to(torch.float32) - y.to(torch.float32)
+    return {
+        "max_abs_diff": float(diff.abs().max().item()),
+        "mean_abs_diff": float(diff.abs().mean().item()),
+        "rmse": float(torch.sqrt(diff.square().mean()).item()),
+    }
+
+
+def logits_quality_metrics(
+    approx: torch.Tensor,
+    dense: torch.Tensor,
+    *,
+    topk: int,
+) -> dict[str, float]:
+    approx = approx.to(torch.float32)
+    dense = dense.to(torch.float32)
+    diff = approx - dense
+
+    k = min(int(topk), int(dense.shape[-1]))
+    approx_idx = torch.topk(approx, k=k, dim=-1).indices
+    dense_idx = torch.topk(dense, k=k, dim=-1).indices
+
+    approx_mask = torch.zeros_like(dense, dtype=torch.bool).scatter_(
+        dim=-1,
+        index=approx_idx,
+        value=True,
+    )
+    overlap = torch.gather(approx_mask, dim=-1, index=dense_idx).float().mean()
+    top1 = (
+        torch.argmax(approx, dim=-1) == torch.argmax(dense, dim=-1)
+    ).float().mean()
+
+    dense_probs = torch.softmax(dense, dim=-1)
+    approx_probs = torch.softmax(approx, dim=-1)
+    candidate_mass = torch.gather(
+        dense_probs,
+        dim=-1,
+        index=approx_idx,
+    ).sum(dim=-1).mean()
+    kl = torch.sum(
+        dense_probs
+        * (
+            torch.log(dense_probs.clamp_min(1e-12))
+            - torch.log(approx_probs.clamp_min(1e-12))
+        ),
+        dim=-1,
+    ).mean()
+
+    return {
+        "max_abs_diff": float(diff.abs().max().item()),
+        "mean_abs_diff": float(diff.abs().mean().item()),
+        "rmse": float(torch.sqrt(diff.square().mean()).item()),
+        f"top{k}_overlap_vs_dense": float(overlap.item()),
+        "top1_agreement_vs_dense": float(top1.item()),
+        f"dense_softmax_mass_on_approx_top{k}": float(candidate_mass.item()),
+        "softmax_kl_dense_to_approx": float(kl.item()),
+    }
+
+
+def model_parameter_summary(model: torch.nn.Module) -> dict[str, Any]:
+    total_params = int(sum(p.numel() for p in model.parameters()))
+    trainable_params = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    svd_modules = []
+    for name, module in model.named_modules():
+        if module.__class__.__name__ in {"SVDLinear", "ASVDLinear"}:
+            svd_modules.append(
+                {
+                    "name": name,
+                    "type": module.__class__.__name__,
+                    "truncation_rank": int(getattr(module, "truncation_rank", -1)),
+                }
+            )
+    return {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "svd_linear_count": len(svd_modules),
+        "svd_linear_preview": svd_modules[:20],
+    }
+
+
+def jsonable_dataclass(obj: Any) -> Any:
+    if is_dataclass(obj):
+        return asdict(obj)
+    return obj
+
+
+
+def _round_rank_down_to_multiple(rank: int, multiple: int, *, min_rank: int) -> int:
+    if int(multiple) <= 1:
+        return int(rank)
+    rounded = (int(rank) // int(multiple)) * int(multiple)
+    return max(int(min_rank), int(rounded))
+
+
+def build_uniform_rank_dict_from_model(
+    model: torch.nn.Module,
+    *,
+    linear_param_ratio: float,
+    name_regex: str,
+    min_rank: int,
+    rank_multiple: int,
+) -> tuple[dict[str, int], dict[str, Any]]:
+    """
+    Build a flat module_name -> rank dict without rank search.
+
+    For each selected Linear W[out, in], choose:
+      rank = floor(linear_param_ratio * out * in / (out + in))
+
+    so the factorized parameter count r*(in+out) is approximately the
+    requested fraction of the original linear weight parameter count.
+    """
+    ratio = float(linear_param_ratio)
+    if not (0.0 < ratio <= 1.0):
+        raise ValueError(
+            f"--uniform_linear_param_ratio must be in (0, 1], got {ratio}."
+        )
+    if int(min_rank) <= 0:
+        raise ValueError("--uniform_min_rank must be positive.")
+    if int(rank_multiple) <= 0:
+        raise ValueError("--uniform_rank_multiple must be positive.")
+
+    cre = re.compile(str(name_regex))
+    rank_dict: dict[str, int] = {}
+    details: list[dict[str, Any]] = []
+
+    selected_weight_params = 0
+    estimated_factorized_params = 0
+    selected_layers = 0
+    skipped_regex = 0
+
+    for name, mod in model.named_modules():
+        if not isinstance(mod, torch.nn.Linear):
+            continue
+        if cre.match(name) is None:
+            skipped_regex += 1
+            continue
+
+        in_f = int(mod.in_features)
+        out_f = int(mod.out_features)
+        full_rank = int(min(in_f, out_f))
+        weight_params = int(in_f * out_f)
+
+        raw_rank = int((ratio * weight_params) // (in_f + out_f))
+        rank = max(int(min_rank), int(raw_rank))
+        rank = _round_rank_down_to_multiple(
+            rank,
+            int(rank_multiple),
+            min_rank=int(min_rank),
+        )
+        rank = min(int(rank), int(full_rank))
+
+        rank_dict[str(name)] = int(rank)
+        factorized_params = int(rank * (in_f + out_f))
+        selected_weight_params += weight_params
+        estimated_factorized_params += factorized_params
+        selected_layers += 1
+
+        details.append(
+            {
+                "name": str(name),
+                "in_features": in_f,
+                "out_features": out_f,
+                "full_rank": full_rank,
+                "rank": int(rank),
+                "weight_params": weight_params,
+                "estimated_factorized_params": factorized_params,
+                "linear_weight_param_ratio": (
+                    float(factorized_params) / float(weight_params)
+                    if weight_params
+                    else 0.0
+                ),
+            }
+        )
+
+    if not rank_dict:
+        raise RuntimeError(
+            "Uniform rank generation selected zero Linear layers. "
+            f"Check --uniform_name_regex={name_regex!r}."
+        )
+
+    summary = {
+        "formula": "rank=floor(ratio*out*in/(out+in)), then optional rank-multiple rounding",
+        "requested_linear_param_ratio": ratio,
+        "target_name_regex": str(name_regex),
+        "min_rank": int(min_rank),
+        "rank_multiple": int(rank_multiple),
+        "selected_layers": int(selected_layers),
+        "selected_weight_params": int(selected_weight_params),
+        "estimated_factorized_params": int(estimated_factorized_params),
+        "achieved_selected_linear_weight_param_ratio": (
+            float(estimated_factorized_params) / float(selected_weight_params)
+            if selected_weight_params
+            else 0.0
+        ),
+        "skipped_linear_layers_by_regex": int(skipped_regex),
+        "rank_preview": details[:20],
+        "rank_details": details,
+    }
+    return rank_dict, summary
+
+
+def save_rank_dict_json(path: str, rank_dict: dict[str, int], summary: dict[str, Any]) -> None:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "value": "rank_flat",
+        "ranks": {str(k): int(v) for k, v in rank_dict.items()},
+        "uniform_rank_generation": summary,
+    }
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[Save] Uniform rank JSON: {out}")
+
+
+def resolve_svd_rebuild_device(requested: str) -> str:
+    requested = str(requested).strip()
+    if requested.lower() == "auto":
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    return requested
+
+
+def save_rebuilt_svd_model(
+    model: torch.nn.Module,
+    tokenizer,
+    *,
+    save_dir: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist a rebuilt SVD model in HuggingFace-compatible format."""
+    out = Path(str(save_dir))
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"[Save:SVDModel] Writing rebuilt SVD model to: {out}")
+    model.save_pretrained(
+        str(out),
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
+    tokenizer.save_pretrained(str(out))
+
+    if metadata is not None:
+        meta_path = out / "svd_rebuild_metadata.json"
+        meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        print(f"[Save:SVDModel] Metadata: {meta_path}")
+
+    total_bytes = 0
+    file_rows = []
+    for p in sorted(out.rglob("*")):
+        if p.is_file():
+            size = p.stat().st_size
+            total_bytes += size
+            file_rows.append({"path": str(p.relative_to(out)), "bytes": int(size)})
+
+    summary = {
+        "save_dir": str(out),
+        "total_bytes": int(total_bytes),
+        "total_gib": float(total_bytes / (1024 ** 3)),
+        "files": file_rows,
+    }
+    print(
+        "[Save:SVDModel] Complete | "
+        f"total={summary['total_gib']:.2f} GiB | files={len(file_rows)}"
+    )
+    return summary
+
+
+def load_saved_svd_model(
+    *,
+    model_dir: str,
+    torch_dtype: torch.dtype | str,
+    device: torch.device,
+    trust_remote_code: bool,
+) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
+    """Load a previously saved rebuilt SVD model and tokenizer."""
+    model_dir = str(model_dir)
+    print(f"[Load:SVDModel] {model_dir}")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        torch_dtype=torch_dtype,
+        device_map="cpu",
+        trust_remote_code=bool(trust_remote_code),
+        low_cpu_mem_usage=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_dir,
+        trust_remote_code=bool(trust_remote_code),
+        use_fast=True,
+    )
+    ensure_tokenizer_padding(tokenizer)
+    model.to(device)
+    model.eval()
+
+    metadata_path = Path(model_dir) / "svd_rebuild_metadata.json"
+    loaded_metadata = None
+    if metadata_path.exists():
+        try:
+            loaded_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            loaded_metadata = {"metadata_load_error": str(e)}
+
+    metadata = {
+        "rank_source": "saved_rebuilt_svd_model",
+        "svd_model_dir": model_dir,
+        "saved_metadata": loaded_metadata,
+    }
+    return model, tokenizer, metadata
+
+def load_or_rebuild_model(args: argparse.Namespace) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
+    dtype = parse_dtype(args.torch_dtype)
+    device = torch.device(args.device)
+
+    metadata: dict[str, Any] = {
+        "rebuild_from_base": bool(args.rebuild_from_base),
+        "method": str(args.method),
+        "model_name": args.model_name,
+        "base_model": args.base_model,
+        "rank_json": args.rank_json,
+        "uniform_linear_param_ratio": args.uniform_linear_param_ratio,
+        "uniform_name_regex": args.uniform_name_regex,
+        "uniform_min_rank": args.uniform_min_rank,
+        "uniform_rank_multiple": args.uniform_rank_multiple,
+        "svd_rebuild_device_requested": args.svd_rebuild_device,
+        "svd_model_dir": args.svd_model_dir,
+        "save_rebuilt_svd_model_dir": args.save_rebuilt_svd_model_dir,
+    }
+
+    if args.svd_model_dir:
+        if args.rebuild_from_base:
+            raise ValueError("Use --svd_model_dir without --rebuild_from_base.")
+        if args.save_rebuilt_svd_model_dir:
+            raise ValueError(
+                "Use either --svd_model_dir or --save_rebuilt_svd_model_dir, not both."
+            )
+        model, tokenizer, loaded_meta = load_saved_svd_model(
+            model_dir=str(args.svd_model_dir),
+            torch_dtype=dtype,
+            device=device,
+            trust_remote_code=bool(args.trust_remote_code),
+        )
+        metadata.update(loaded_meta)
+        return model, tokenizer, metadata
+
+    if args.rebuild_from_base:
+        if not args.base_model:
+            raise ValueError("--rebuild_from_base requires --base_model.")
+        if args.rank_json and args.uniform_linear_param_ratio is not None:
+            raise ValueError(
+                "Use either --rank_json or --uniform_linear_param_ratio, not both."
+            )
+        if (not args.rank_json) and args.uniform_linear_param_ratio is None:
+            raise ValueError(
+                "--rebuild_from_base requires either --rank_json or "
+                "--uniform_linear_param_ratio."
+            )
+
+        from config_eval_svdmodel import (
+            apply_svd_ranks_inplace,
+            apply_whiten_ranks_inplace,
+            estimate_params_from_ranks,
+            load_rank_json,
+        )
+
+        print(f"[Load] Base model: {args.base_model}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            torch_dtype=dtype,
+            device_map="cpu",
+            trust_remote_code=bool(args.trust_remote_code),
+            low_cpu_mem_usage=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.base_model,
+            trust_remote_code=bool(args.trust_remote_code),
+            use_fast=True,
+        )
+        ensure_tokenizer_padding(tokenizer)
+
+        if args.rank_json:
+            rank_dict = load_rank_json(args.rank_json)
+            metadata["rank_source"] = "rank_json"
+            metadata["rank_entries"] = int(len(rank_dict))
+        else:
+            rank_dict, uniform_summary = build_uniform_rank_dict_from_model(
+                model,
+                linear_param_ratio=float(args.uniform_linear_param_ratio),
+                name_regex=str(args.uniform_name_regex),
+                min_rank=int(args.uniform_min_rank),
+                rank_multiple=int(args.uniform_rank_multiple),
+            )
+            metadata["rank_source"] = "uniform_linear_param_ratio"
+            metadata["rank_entries"] = int(len(rank_dict))
+            metadata["uniform_rank_generation"] = uniform_summary
+            if args.save_uniform_rank_json:
+                save_rank_dict_json(
+                    str(args.save_uniform_rank_json),
+                    rank_dict,
+                    uniform_summary,
+                )
+
+        acct = estimate_params_from_ranks(model, rank_dict, strict=bool(args.strict))
+        metadata["rank_param_accounting"] = jsonable_dataclass(acct)
+
+        model.eval()
+        torch.set_grad_enabled(False)
+
+        if args.method == "svd":
+            svd_rebuild_device = resolve_svd_rebuild_device(args.svd_rebuild_device)
+            metadata["svd_rebuild_device_resolved"] = svd_rebuild_device
+            model = apply_svd_ranks_inplace(
+                model,
+                rank_dict,
+                dtype=dtype,
+                svd_device=svd_rebuild_device,
+                progress=True,
+            )
+            if args.save_rebuilt_svd_model_dir:
+                metadata["saved_rebuilt_svd_model"] = save_rebuilt_svd_model(
+                    model,
+                    tokenizer,
+                    save_dir=str(args.save_rebuilt_svd_model_dir),
+                    metadata=metadata,
+                )
+            model.to(device)
+        elif args.method == "whiten":
+            # whiten rebuild profiles/calibrates on GPU, matching config_eval_svdmodel.py
+            model.to(device)
+            model = apply_whiten_ranks_inplace(model, tokenizer, rank_dict, args)
+        else:
+            raise ValueError(f"Unsupported --method {args.method!r}")
+
+        if args.save_rebuilt_dir:
+            save_dir = Path(args.save_rebuilt_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[Save] Rebuilt compressed model: {save_dir}")
+            model.save_pretrained(save_dir)
+            tokenizer.save_pretrained(save_dir)
+            metadata["save_rebuilt_dir"] = str(save_dir)
+
+    else:
+        if not args.model_name:
+            raise ValueError("Set --model_name, or use --rebuild_from_base.")
+        print(f"[Load] Model: {args.model_name}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=dtype,
+            device_map="cpu",
+            trust_remote_code=bool(args.trust_remote_code),
+            low_cpu_mem_usage=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_name,
+            trust_remote_code=bool(args.trust_remote_code),
+            use_fast=True,
+        )
+        ensure_tokenizer_padding(tokenizer)
+        model.eval()
+        torch.set_grad_enabled(False)
+        model.to(device)
+
+    torch.cuda.empty_cache()
+    metadata["parameter_summary"] = model_parameter_summary(model)
+    return model, tokenizer, metadata
+
+
+@torch.no_grad()
+def time_generate(
+    model,
+    tokenizer,
+    input_ids: torch.Tensor,
+    *,
+    max_new_tokens: int,
+    repeats: int,
+    warmup: int,
+) -> dict[str, Any]:
+    if int(repeats) <= 0:
+        raise ValueError("repeats must be positive.")
+    if int(warmup) < 0:
+        raise ValueError("warmup must be non-negative.")
+
+    def run_once() -> tuple[float, torch.Tensor, float]:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        sync()
+        start = time.perf_counter()
+        out = model.generate(
+            input_ids=input_ids,
+            do_sample=False,
+            use_cache=True,
+            max_new_tokens=int(max_new_tokens),
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        sync()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        peak_gib = float(torch.cuda.max_memory_allocated() / (1024 ** 3))
+        return float(elapsed_ms), out, peak_gib
+
+    for _ in range(int(warmup)):
+        _elapsed, _out, _peak = run_once()
+
+    elapsed_samples: list[float] = []
+    throughput_samples: list[float] = []
+    peak_samples: list[float] = []
+    output_len_samples: list[int] = []
+    last_output = None
+
+    prompt_len = int(input_ids.shape[1])
+    batch_size = int(input_ids.shape[0])
+
+    for _ in range(int(repeats)):
+        elapsed_ms, out, peak_gib = run_once()
+        generated = int(out.shape[1] - prompt_len)
+        tok_per_sec = (
+            float(batch_size * generated) / (elapsed_ms / 1000.0)
+            if elapsed_ms > 0 and generated > 0
+            else float("nan")
+        )
+        elapsed_samples.append(float(elapsed_ms))
+        throughput_samples.append(float(tok_per_sec))
+        peak_samples.append(float(peak_gib))
+        output_len_samples.append(generated)
+        last_output = out
+
+    return {
+        "elapsed_ms": summarize_samples(elapsed_samples),
+        "throughput_tok_per_sec": summarize_samples(throughput_samples),
+        "peak_memory_gib": summarize_samples(peak_samples),
+        "generated_tokens": output_len_samples,
+        "last_output_shape": list(last_output.shape) if last_output is not None else None,
+    }
+
+
+@torch.no_grad()
+def run_e2e_generation_benchmarks(
+    model,
+    tokenizer,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    device = torch.device(args.device)
+    results: dict[str, Any] = {}
+
+    for prompt_len in args.e2e_prompt_lens:
+        input_ids = build_repeated_prompt_ids(
+            tokenizer,
+            prompt_len=int(prompt_len),
+            batch_size=int(args.e2e_batch_size),
+            text=str(args.text),
+            device=device,
+        )
+        print(f"[E2E:TTFT] prompt_len={prompt_len}")
+        ttft = time_generate(
+            model,
+            tokenizer,
+            input_ids,
+            max_new_tokens=1,
+            repeats=int(args.e2e_repeats),
+            warmup=int(args.e2e_warmup),
+        )
+        print(f"[E2E:Decode] prompt_len={prompt_len}, max_new_tokens={args.e2e_generate_len}")
+        decode = time_generate(
+            model,
+            tokenizer,
+            input_ids,
+            max_new_tokens=int(args.e2e_generate_len),
+            repeats=int(args.e2e_repeats),
+            warmup=int(args.e2e_warmup),
+        )
+        results[str(prompt_len)] = {
+            "prompt_len": int(prompt_len),
+            "batch_size": int(args.e2e_batch_size),
+            "ttft_generate_1_token": ttft,
+            "decode_generate_n_tokens": decode,
+        }
+        del input_ids
+        torch.cuda.empty_cache()
+
+    return results
+
+
+@torch.no_grad()
+def run_optional_ppl(model, tokenizer, args: argparse.Namespace) -> dict[str, Any] | None:
+    if not args.eval_ppl:
+        return None
+    print("[PPL] Running eval_svdmodel.eval_ppl on Wikitext2.")
+    import eval_svdmodel as base_eval
+
+    ppl, neg_loss = base_eval.eval_ppl(
+        model,
+        tokenizer,
+        seqlen=int(args.ppl_seqlen),
+        batch_size=int(args.ppl_batch_size),
+    )
+    return {
+        "dataset": "wikitext2",
+        "seqlen": int(args.ppl_seqlen),
+        "batch_size": int(args.ppl_batch_size),
+        "ppl": float(ppl),
+        "neg_loss": float(neg_loss),
+    }
+
+
+@torch.no_grad()
+def bench_cuda_ms(
+    fn: Callable[[], torch.Tensor],
+    *,
+    warmup: int,
+    iters: int,
+) -> tuple[float, torch.Tensor]:
+    out = None
+    for _ in range(int(warmup)):
+        out = fn()
+    sync()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(int(iters)):
+        out = fn()
+    end.record()
+    sync()
+
+    if out is None:
+        raise RuntimeError("CUDA benchmark produced no output.")
+    return float(start.elapsed_time(end) / int(iters)), out
+
+
+@torch.no_grad()
+def run_svd_turboquant_qk_readiness(
+    model,
+    tokenizer,
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    device = torch.device(args.device)
+    out: list[dict[str, Any]] = []
+
+    for layer_idx in args.tq_layers:
+        for seq_len in args.tq_seq_lens:
+            print(f"[TQ:SVD-QK] layer={layer_idx}, T={seq_len}")
+            input_ids = build_repeated_prompt_ids(
+                tokenizer,
+                prompt_len=int(seq_len),
+                batch_size=1,
+                text=str(args.text),
+                device=device,
+            )
+
+            qk = capture_llama_style_qk(
+                model,
+                input_ids,
+                layer_idx=int(layer_idx),
+                num_query_tokens=1,
+                apply_rope=not bool(args.no_rope),
+            )
+
+            D = int(qk.queries.shape[-1])
+            if D != 128:
+                raise ValueError(
+                    f"Optimized true-TurboQuant CUDA kernels expect D=128, got D={D} "
+                    f"at layer {layer_idx}."
+                )
+
+            rotation = make_random_orthogonal_rotation(
+                D,
+                seed=int(args.rotation_seed) + int(layer_idx),
+                device=device,
+            )
+            rotated_key_samples = torch.matmul(
+                qk.keys.reshape(-1, D),
+                rotation.T,
+            ).contiguous()
+            centroids = fit_lloyd_scalar_codebook(
+                rotated_key_samples,
+                num_levels=16,
+                max_iters=int(args.lloyd_iters),
+                max_samples=int(args.max_codebook_samples),
+                seed=int(args.codebook_seed) + int(layer_idx),
+            )
+            sketch = make_gaussian_sketch(
+                D,
+                128,
+                seed=int(args.sketch_seed) + int(layer_idx),
+                device=device,
+            )
+            encoding = encode_turboquant_prod_keys(
+                qk.keys,
+                rotation=rotation,
+                centroids=centroids,
+                sketch=sketch,
+            )
+
+            dense_ref = dense_fp32_logits(qk.queries, qk.keys)
+            tq_ref = turboquant_prod_reference_logits(
+                qk.queries,
+                encoding,
+                rotation=rotation,
+                centroids=centroids,
+                sketch=sketch,
+            )
+
+            rotated_queries = rotate(qk.queries, rotation).to(torch.float32).contiguous()
+            qjl_projected_queries = qjl_project_query(qk.queries, sketch).to(torch.float32).contiguous()
+            lane_word_scalar_codes = pack_scalar_codes_lane_word_4bit(encoding.codes.contiguous())
+            lane_nibble_signs = pack_qjl_signs_lane_nibble(encoding.residual_signs.contiguous())
+            residual_norms = encoding.residual_norms.contiguous().to(torch.float32)
+
+            factor_build_ms, scalar_factor_lut = bench_cuda_ms(
+                lambda: build_scalar_factor_lut_fp32(rotated_queries, centroids),
+                warmup=int(args.tq_build_warmup),
+                iters=int(args.tq_build_iters),
+            )
+
+            dense_ms, dense_cuda = bench_cuda_ms(
+                lambda: dense_fp32_qkt_b1q1_d128_cuda(qk.queries, qk.keys),
+                warmup=int(args.tq_warmup),
+                iters=int(args.tq_iters),
+            )
+            nonfactor_ms, nonfactor_cuda = bench_cuda_ms(
+                lambda: turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_cuda(
+                    rotated_queries=rotated_queries,
+                    lane_word_scalar_codes=lane_word_scalar_codes,
+                    qjl_projected_queries=qjl_projected_queries,
+                    lane_nibble_qjl_signs=lane_nibble_signs,
+                    residual_norms=residual_norms,
+                    centroids=centroids,
+                ),
+                warmup=int(args.tq_warmup),
+                iters=int(args.tq_iters),
+            )
+            factor_ms, factor_cuda = bench_cuda_ms(
+                lambda: turboquant_factor_lut_combined_reduction_4bit_qjl128_logits_b1q1_d128_cuda(
+                    scalar_factor_lut=scalar_factor_lut,
+                    lane_word_scalar_codes=lane_word_scalar_codes,
+                    qjl_projected_queries=qjl_projected_queries,
+                    lane_nibble_qjl_signs=lane_nibble_signs,
+                    residual_norms=residual_norms,
+                ),
+                warmup=int(args.tq_warmup),
+                iters=int(args.tq_iters),
+            )
+
+            factor_effective_ms = float(factor_build_ms + factor_ms)
+            result = {
+                "layer_idx": int(layer_idx),
+                "seq_len": int(seq_len),
+                "qk_capture": {
+                    "queries_shape": list(qk.queries.shape),
+                    "keys_shape": list(qk.keys.shape),
+                    "rope_applied": bool(qk.rope_applied),
+                    "rope_detail": str(qk.rope_detail),
+                    "num_attention_heads": int(qk.num_attention_heads),
+                    "num_key_value_heads": int(qk.num_key_value_heads),
+                    "key_heads_expanded": bool(qk.key_heads_expanded),
+                },
+                "timing_ms": {
+                    "dense_fp32_qkt_cuda": float(dense_ms),
+                    "nonfactor_combined_cuda": float(nonfactor_ms),
+                    "factor_lut_build": float(factor_build_ms),
+                    "factor_lut_kernel": float(factor_ms),
+                    "factor_lut_effective_build_plus_kernel": float(factor_effective_ms),
+                },
+                "speedup_vs_dense_cuda": {
+                    "nonfactor_over_dense": float(dense_ms / nonfactor_ms),
+                    "factor_kernel_only_over_dense": float(dense_ms / factor_ms),
+                    "factor_effective_over_dense": float(dense_ms / factor_effective_ms),
+                },
+                "cuda_parity": {
+                    "dense_cuda_vs_dense_ref": error_metrics(dense_cuda, dense_ref),
+                    "nonfactor_cuda_vs_tq_ref": error_metrics(nonfactor_cuda, tq_ref),
+                    "factor_cuda_vs_tq_ref": error_metrics(factor_cuda, tq_ref),
+                    "factor_cuda_vs_nonfactor_cuda": error_metrics(factor_cuda, nonfactor_cuda),
+                },
+                "quality_vs_dense_fp32_qkt": {
+                    "pytorch_tq_reference": logits_quality_metrics(
+                        tq_ref,
+                        dense_ref,
+                        topk=int(args.tq_quality_topk),
+                    ),
+                    "nonfactor_cuda": logits_quality_metrics(
+                        nonfactor_cuda,
+                        dense_ref,
+                        topk=int(args.tq_quality_topk),
+                    ),
+                    "factor_cuda": logits_quality_metrics(
+                        factor_cuda,
+                        dense_ref,
+                        topk=int(args.tq_quality_topk),
+                    ),
+                },
+            }
+            print(json.dumps(result, indent=2))
+            out.append(result)
+
+            del input_ids, qk, rotated_key_samples, centroids, sketch, encoding
+            del dense_ref, tq_ref, rotated_queries, qjl_projected_queries
+            del lane_word_scalar_codes, lane_nibble_signs, residual_norms
+            del scalar_factor_lut, dense_cuda, nonfactor_cuda, factor_cuda
+            torch.cuda.empty_cache()
+
+    return out
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "End-to-end SVD-compressed model benchmark plus TurboQuant decode-attention "
+            "readiness validation on real SVD-model Q/K activations."
+        )
+    )
+
+    # Model selection / rebuild.
+    p.add_argument("--model_name", default=None, help="Saved compressed model dir/repo.")
+    p.add_argument("--base_model", default="meta-llama/Llama-2-7b-hf")
+    p.add_argument("--rank_json", default=None)
+    p.add_argument(
+        "--uniform_linear_param_ratio",
+        type=float,
+        default=None,
+        help=(
+            "Generate ranks directly without rank search. "
+            "For each selected Linear W[out,in], use "
+            "rank=floor(ratio*out*in/(out+in)). "
+            "Use 0.8 for uniform 20% compression of target Linear weights."
+        ),
+    )
+    p.add_argument(
+        "--uniform_name_regex",
+        default=DEFAULT_UNIFORM_TARGET_LINEAR_REGEX,
+        help="Regex selecting Linear modules for uniform rank generation.",
+    )
+    p.add_argument(
+        "--uniform_min_rank",
+        type=int,
+        default=1,
+        help="Minimum generated rank for uniform rank generation.",
+    )
+    p.add_argument(
+        "--uniform_rank_multiple",
+        type=int,
+        default=1,
+        help="Round generated ranks down to this multiple; default 1 means no rounding.",
+    )
+    p.add_argument(
+        "--save_uniform_rank_json",
+        default=None,
+        help="Optional path to save the generated flat uniform rank dictionary.",
+    )
+    p.add_argument("--rebuild_from_base", action="store_true")
+    p.add_argument("--method", choices=["svd", "whiten"], default="svd")
+    p.add_argument("--save_rebuilt_dir", default=None)
+    p.add_argument("--strict", action="store_true")
+    p.add_argument("--trust_remote_code", action="store_true")
+    p.add_argument("--torch_dtype", default="fp16")
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument(
+        "--svd_rebuild_device",
+        default="auto",
+        help=(
+            "Device used only for per-layer torch.linalg.svd during plain SVD rebuild. "
+            "'auto' selects cuda:0 when available, otherwise cpu."
+        ),
+    )
+    p.add_argument(
+        "--svd_model_dir",
+        default=None,
+        help=(
+            "Load a previously saved rebuilt SVD model from this directory and "
+            "skip the SVD rebuild."
+        ),
+    )
+    p.add_argument(
+        "--save_rebuilt_svd_model_dir",
+        default=None,
+        help=(
+            "After uniform-SVD rebuild, save the rebuilt model/tokenizer here "
+            "with safe_serialization=True and 5GB shards."
+        ),
+    )
+
+    # Whiten rebuild knobs.
+    p.add_argument("--calib_dataset", choices=["wikitext2", "c4"], default="wikitext2")
+    p.add_argument("--n_calib_samples", type=int, default=256)
+    p.add_argument("--seqlen", type=int, default=2048)
+    p.add_argument("--calib_seed", type=int, default=3)
+    p.add_argument("--search_with_succinct", action="store_true")
+    p.add_argument("--sigma_fuse", type=bool, default=True)
+
+    # E2E generation.
+    p.add_argument("--text", default=DEFAULT_TEXT)
+    p.add_argument("--e2e_prompt_lens", type=int, nargs="+", default=[1024, 2048, 4096])
+    p.add_argument("--e2e_generate_len", type=int, default=32)
+    p.add_argument("--e2e_batch_size", type=int, default=1)
+    p.add_argument("--e2e_repeats", type=int, default=3)
+    p.add_argument("--e2e_warmup", type=int, default=1)
+
+    # Optional PPL.
+    p.add_argument("--eval_ppl", action="store_true")
+    p.add_argument("--ppl_seqlen", type=int, default=2048)
+    p.add_argument("--ppl_batch_size", type=int, default=1)
+
+    # TurboQuant readiness on SVD Q/K activations.
+    p.add_argument("--skip_tq_qk_readiness", action="store_true")
+    p.add_argument("--tq_layers", type=int, nargs="+", default=[0, 15, 31])
+    p.add_argument("--tq_seq_lens", type=int, nargs="+", default=[2048, 4096, 8192])
+    p.add_argument("--tq_warmup", type=int, default=20)
+    p.add_argument("--tq_iters", type=int, default=100)
+    p.add_argument("--tq_build_warmup", type=int, default=20)
+    p.add_argument("--tq_build_iters", type=int, default=200)
+    p.add_argument("--tq_quality_topk", type=int, default=32)
+    p.add_argument("--lloyd_iters", type=int, default=20)
+    p.add_argument("--max_codebook_samples", type=int, default=1_000_000)
+    p.add_argument("--rotation_seed", type=int, default=101)
+    p.add_argument("--sketch_seed", type=int, default=202)
+    p.add_argument("--codebook_seed", type=int, default=303)
+    p.add_argument("--no_rope", action="store_true")
+
+    p.add_argument("--out", required=True)
+    return p.parse_args()
+
+
+@torch.no_grad()
+def main() -> None:
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required.")
+
+    print("========== Uniform-SVD compressed model E2E + TurboQuant decode readiness ==========")
+    print("[Scope]")
+    print("  E2E section measures the actual SVD-compressed model generate()/TTFT path.")
+    print("  TurboQuant section validates the current B=1,Q=1,D=128 decode logits CUDA")
+    print("  kernels on real Q/K activations captured from that SVD-compressed model.")
+    print("  Full model attention replacement is intentionally not claimed by this script.")
+
+    model, tokenizer, model_metadata = load_or_rebuild_model(args)
+    model.eval()
+
+    e2e_generation = run_e2e_generation_benchmarks(model, tokenizer, args)
+    ppl_result = run_optional_ppl(model, tokenizer, args)
+
+    if args.skip_tq_qk_readiness:
+        tq_readiness = []
+    else:
+        tq_readiness = run_svd_turboquant_qk_readiness(model, tokenizer, args)
+
+    payload = {
+        "benchmark": "svd_compressed_model_e2e_decode_plus_turboquant_readiness",
+        "scope": {
+            "e2e_model_generate": True,
+            "e2e_attention_replacement_by_turboquant": False,
+            "turboquant_qk_readiness_on_svd_activations": not bool(args.skip_tq_qk_readiness),
+            "kernel_contract": "B=1,Q=1,D=128 decode logits",
+        },
+        "config": vars(args),
+        "model_metadata": model_metadata,
+        "e2e_generation": e2e_generation,
+        "ppl": ppl_result,
+        "turboquant_svd_qk_readiness": tq_readiness,
+    }
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[Save] {out}")
+
+
+if __name__ == "__main__":
+    main()

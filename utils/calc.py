@@ -1,85 +1,70 @@
-from modules.svd_linear import SVDLinear
-import csv
-import random
-import string
-import click
+from __future__ import annotations
 
-# TODO: Fix the parameter ratio calculation for flexible weight size
-def rank_to_param_ratio(module_dict, sen_list, succinct=True):
-    # Coordination transformation (rank dimention)
-    
-    calib_list = {}
-    mapping = {}
-    
-    for name, lst in sen_list.items():
-        linear_type = name.split('.')[-1]
-        
-        # if linear_type in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-        #     n_params = QKVO_PARAM
-        #     in_plus_out = HIDDEN_SIZE + HIDDEN_SIZE
-        # elif linear_type in ['gate_proj', 'up_proj', 'down_proj']:
-        #     n_params = MLP_PARAM
-        #     in_plus_out = HIDDEN_SIZE + IMMEIDATE_SIZE
-          
-        raw_linear = module_dict[name]
-        n_params = raw_linear.weight.numel()
-        in_plus_out = raw_linear.in_features + raw_linear.out_features
-        
-        calib_list[name] = {}
-        mapping[name] = {}  # ratio -> rank
-        # Mapping
-        for rank in lst.keys():
-            if succinct:
-                new_ratio = (rank * in_plus_out - rank ** 2) / n_params
-            else:
-                new_ratio = (rank * in_plus_out) / n_params
-            calib_list[name][new_ratio] = lst[rank]
-            mapping[name][new_ratio] = rank
-        
-    return calib_list, mapping
+from typing import Any
 
-def catch_succinct_error(model, save_file=None):
-    # Catch the transformer layer
-    layers = model.model.layers
-    module_dict = {}
-    for name, module in model.named_modules():
-        if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "gate_proj" in name or "up_proj" in name or "down_proj" in name:
-            module_dict[name] = module
-    
-    # Init keys from module_dict to error_list
-    error_list = {}
-    for name, module in module_dict.items():
-        if isinstance(module, SVDLinear):
-            assert module.succinct_error is not None, f"{name} has no succinct error"
-            error_list[name] = module.succinct_error
-        else: # nn.Linear
-            if "ALinear" in name or "BLinear" in name:
-                pass
-            else:
-                error_list[name] = 0.0
 
-    # Save error_list to csv
-    if save_file is not None:
-        save_csv = save_file + ".csv"
-    else:
-        save_csv = "succinct_error" . join(random.choices(string.ascii_uppercase + string.digits, k=5)) + ".csv"
-    
-    with open(save_csv, 'w+', newline='') as csvfile:
-        fieldnames = ['module', 'error']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+def _linear_dims(module: Any) -> tuple[int, int]:
+    try:
+        in_features = int(module.in_features)
+        out_features = int(module.out_features)
+    except Exception as exc:
+        raise TypeError(f"Expected a Linear-like module, got {type(module)!r}") from exc
+    return in_features, out_features
 
-        writer.writeheader()
-        for name in error_list:
-            writer.writerow({"module": name, "error": error_list[name]})
-    click.secho(f"Error list is saved to {save_csv}", fg="yellow")
 
-def set_uniform_truncation_rank(module_dict, linear_info, target_ratio):
-    uniform_rank_list = {}
-    for raw_linear, info in linear_info.items():
-        if info["full_name"] == "lm_head":
+def _rank_for_ratio(module: Any, param_ratio: float) -> int:
+    in_features, out_features = _linear_dims(module)
+    full_rank = min(in_features, out_features)
+    rank = int(float(param_ratio) * in_features * out_features / (in_features + out_features))
+    rank = max(1, min(full_rank, rank))
+    return rank
+
+
+def set_uniform_truncation_rank(
+    module_dict: dict[str, Any],
+    linear_info: dict[Any, dict[str, Any]],
+    param_ratio_target: float,
+) -> dict[str, int]:
+    """Return layer_name -> uniform rank for llm_rs.py.
+
+    The rank formula matches the low-rank parameter-count ratio convention:
+        rank * (in + out) ~= ratio * in * out
+
+    `compress_model_whiten(...)` already skips unsupported / unwhitened linears
+    such as lm_head, so this function can safely emit every collected Linear.
+    """
+    result: dict[str, int] = {}
+    for module, info in linear_info.items():
+        full_name = str(info["full_name"])
+        result[full_name] = _rank_for_ratio(module, float(param_ratio_target))
+    return result
+
+
+def rank_to_param_ratio(
+    module_dict: dict[str, Any],
+    sensitivity_dict: dict[str, dict[Any, float]],
+    succinct: bool = False,
+):
+    """Convert rank-keyed sensitivity maps into parameter-ratio-keyed maps.
+
+    This compatibility helper is primarily for existing greedy/binary search
+    imports. The current project flow uses `search_method=uniform`, but keeping
+    this function available preserves the older entry points.
+    """
+    converted: dict[str, dict[float, float]] = {}
+    mapping: dict[str, dict[float, int]] = {}
+
+    for layer_name, rank_to_score in sensitivity_dict.items():
+        module = module_dict.get(layer_name)
+        if module is None:
             continue
-        H, W = raw_linear.weight.shape
-        rank = int((H * W * target_ratio) / (H + W))
-        uniform_rank_list[info["full_name"]] = rank
-    
-    return uniform_rank_list
+        in_features, out_features = _linear_dims(module)
+        converted[layer_name] = {}
+        mapping[layer_name] = {}
+        for rank_raw, score in rank_to_score.items():
+            rank = int(rank_raw)
+            ratio = float(rank * (in_features + out_features) / (in_features * out_features))
+            ratio = round(ratio, 12)
+            converted[layer_name][ratio] = score
+            mapping[layer_name][ratio] = rank
+    return converted, mapping
