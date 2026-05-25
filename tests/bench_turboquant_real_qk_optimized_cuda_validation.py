@@ -14,6 +14,12 @@ if str(ROOT) not in sys.path:
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    from modules.svd_hf_registry import register_svdllama_auto_classes
+    register_svdllama_auto_classes()
+except Exception:
+    pass
+
 from turboquant import (
     make_random_orthogonal_rotation,
     fit_lloyd_scalar_codebook,

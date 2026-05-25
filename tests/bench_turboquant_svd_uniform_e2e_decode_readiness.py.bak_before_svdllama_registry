@@ -17,9 +17,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import torch
-from modules.svd_hf_registry import register_svdllama_auto_classes
-register_svdllama_auto_classes()
-
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from turboquant import (
@@ -784,27 +781,6 @@ def run_svd_turboquant_qk_readiness(
                 num_query_tokens=1,
                 apply_rope=not bool(args.no_rope),
             )
-
-            
-            def _tensor_stats(name, x):
-                xf = x.float()
-                finite = torch.isfinite(xf)
-                finite_ratio = float(finite.float().mean().item())
-                safe = torch.nan_to_num(xf, nan=0.0, posinf=0.0, neginf=0.0)
-                print({
-                    "debug_tensor": name,
-                    "shape": list(x.shape),
-                    "finite_ratio": finite_ratio,
-                    "nan_count": int(torch.isnan(xf).sum().item()),
-                    "posinf_count": int(torch.isposinf(xf).sum().item()),
-                    "neginf_count": int(torch.isneginf(xf).sum().item()),
-                    "absmax_finite": float(safe.abs().max().item()),
-                    "mean_finite_safe": float(safe.mean().item()),
-                    "std_finite_safe": float(safe.std().item()),
-                })
-
-            _tensor_stats("qk.queries", qk.queries)
-            _tensor_stats("qk.keys", qk.keys)
 
             D = int(qk.queries.shape[-1])
             if D != 128:

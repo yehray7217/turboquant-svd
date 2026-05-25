@@ -65,11 +65,11 @@ from turboquant import (
     make_gaussian_sketch,
     encode_turboquant_prod_keys,
 )
-from turboquant.qjl import qjl_project_query, qjl_encode_residual
+from turboquant.qjl import qjl_project_query, qjl_residual_logits, qjl_encode_residual
 from turboquant.rotation import rotate, inverse_rotate
 from turboquant.scalar_quant import scalar_quantize, scalar_dequantize
-from turboquant.scalar_lane_layout import pack_scalar_codes_lane_word_4bit
-from turboquant.qjl_sign_layout import pack_qjl_signs_lane_nibble
+from turboquant.scalar_lane_layout import pack_scalar_codes_lane_word_4bit, unpack_scalar_codes_lane_word_4bit
+from turboquant.qjl_sign_layout import pack_qjl_signs_lane_nibble, unpack_qjl_signs_lane_nibble
 from turboquant.decode_pack_cuda_fastpath import DecodePackCudaFastPath, pack_qjl_signs_1bit_cuda, fused_residual_qjl256_pack_cuda, fused_scalar_quant_pack_4bit_cuda
 from turboquant.turboquant_combined_reduction_nonfactor_ablation_cuda import (
     turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_cuda,
@@ -515,8 +515,8 @@ def _cache_update(
             old_v = None
 
             try:
-                old_k = past.key_cache[int(layer_idx)]
-                old_v = past.value_cache[int(layer_idx)]
+                old_k = past.key_cache[int(getattr(state, "layer_idx", -1))]
+                old_v = past.value_cache[int(getattr(state, "layer_idx", -1))]
             except Exception:
                 pass
 
@@ -640,6 +640,56 @@ def _summary_ms(xs: list[float]) -> dict[str, Any]:
         "p90_ms": float(vals[p90_idx]),
         "times_ms": [float(x) for x in xs],
     }
+
+
+
+def _reference_tq_logits_from_packed(
+    *,
+    rotated_queries: torch.Tensor,
+    qjl_projected_queries: torch.Tensor,
+    centroids: torch.Tensor,
+    scalar_lane_words: torch.Tensor,
+    qjl_lane_nibbles: torch.Tensor,
+    residual_norms: torch.Tensor,
+    active_kv_len: int | None = None,
+) -> torch.Tensor:
+    """
+    Slow PyTorch reference TQ logits for qjl_dim > 128 quality validation.
+
+    Expected:
+      rotated_queries:        [1,H,1,D]
+      qjl_projected_queries:  [1,H,1,M]
+      scalar_lane_words:      [1,H,T,D/2] packed 4-bit lane-word codes
+      qjl_lane_nibbles:       [1,H,T,M/8]
+      residual_norms:         [1,H,T]
+      centroids:              [16]
+    """
+    T = int(scalar_lane_words.shape[-2])
+    if active_kv_len is not None:
+        T = min(T, int(active_kv_len))
+
+    scalar_packed = scalar_lane_words[..., :T, :].contiguous()
+    qjl_packed = qjl_lane_nibbles[..., :T, :].contiguous()
+    norms = residual_norms[..., :T].contiguous()
+
+    # Unpack scalar codes to [1,H,T,D].
+    codes = unpack_scalar_codes_lane_word_4bit(scalar_packed).to(torch.long)
+    deq = centroids.to(torch.float32)[codes].to(torch.float32)
+
+    q_rot = rotated_queries.to(torch.float32)
+    scalar_logits = torch.einsum("bhqd,bhtd->bhqt", q_rot, deq)
+
+    qjl_dim = int(qjl_projected_queries.shape[-1])
+    signs = unpack_qjl_signs_lane_nibble(qjl_packed, qjl_dim=qjl_dim).to(torch.float32)
+
+    # qjl_residual_logits expects projected query and residual signs/norms.
+    residual_logits = qjl_residual_logits(
+        qjl_projected_queries.to(torch.float32),
+        signs,
+        norms.to(torch.float32),
+    )
+
+    return (scalar_logits + residual_logits).contiguous()
 
 
 def _try_call_nonfactor_kernel(
@@ -933,15 +983,13 @@ class TQStaticValueCache(Cache):
     used by tests/bench_turboquant_decode_attention_cuda_true_timing.py.
     """
 
-    def __init__(self, *, reserve_tokens: int, tq_layers: set[int] | None = None) -> None:
+    def __init__(self, *, reserve_tokens: int) -> None:
         self.key_cache = []
         self.value_cache = []
-        self.key_storage = []
         self.value_storage = []
         self.cache_len = []
         self.cache_capacity = []
         self.reserve_tokens = max(0, int(reserve_tokens))
-        self.tq_layers = set(int(x) for x in (tq_layers or set()))
         self.seen_tokens = 0
 
     def __len__(self) -> int:
@@ -951,7 +999,6 @@ class TQStaticValueCache(Cache):
         while len(self.key_cache) <= int(layer_idx):
             self.key_cache.append(None)
             self.value_cache.append(None)
-            self.key_storage.append(None)
             self.value_storage.append(None)
             self.cache_len.append(0)
             self.cache_capacity.append(0)
@@ -983,36 +1030,20 @@ class TQStaticValueCache(Cache):
             v_shape = list(value_states.shape)
             v_shape[-2] = capacity
 
-            v_storage = torch.empty(
+            storage = torch.empty(
                 v_shape,
                 dtype=value_states.dtype,
                 device=value_states.device,
             )
-            v_storage[..., :prefix_len, :].copy_(value_states)
+            storage[..., :prefix_len, :].copy_(value_states)
 
-            self.value_storage[layer_i] = v_storage
+            self.value_storage[layer_i] = storage
             self.cache_len[layer_i] = prefix_len
             self.cache_capacity[layer_i] = capacity
 
-            if layer_i in self.tq_layers:
-                # TQ layer: keep prefix dense K only. Appended K is stored only
-                # in TurboQuant compressed-K state.
-                self.key_storage[layer_i] = None
-                self.key_cache[layer_i] = key_states
-            else:
-                # Dense layer: original attention still needs K/V same length.
-                k_shape = list(key_states.shape)
-                k_shape[-2] = capacity
-                k_storage = torch.empty(
-                    k_shape,
-                    dtype=key_states.dtype,
-                    device=key_states.device,
-                )
-                k_storage[..., :prefix_len, :].copy_(key_states)
-                self.key_storage[layer_i] = k_storage
-                self.key_cache[layer_i] = k_storage[..., :prefix_len, :]
-
-            self.value_cache[layer_i] = v_storage[..., :prefix_len, :]
+            # Keep prefix dense K only. Do not allocate expanded dense K.
+            self.key_cache[layer_i] = key_states
+            self.value_cache[layer_i] = storage[..., :prefix_len, :]
 
             if layer_i == 0:
                 self.seen_tokens = prefix_len
@@ -1034,20 +1065,9 @@ class TQStaticValueCache(Cache):
         self.value_storage[layer_i][..., start:end, :].copy_(value_states)
         self.cache_len[layer_i] = end
 
+        # Keep dense K as prefix-only. TQ compressed K handles appended K.
+        active_k = self.key_cache[layer_i]
         active_v = self.value_storage[layer_i][..., :end, :]
-
-        if layer_i in self.tq_layers:
-            # TQ layer: dense K remains prefix-only; compressed-K cache is
-            # updated separately by the replacement forward.
-            active_k = self.key_cache[layer_i]
-        else:
-            # Dense layer: append K by slice-write too, so original SDPA sees
-            # matching K/V sequence lengths without torch.cat.
-            if self.key_storage[layer_i] is None:
-                raise RuntimeError(f"Dense layer {layer_i} missing key_storage.")
-            self.key_storage[layer_i][..., start:end, :].copy_(key_states)
-            active_k = self.key_storage[layer_i][..., :end, :]
-            self.key_cache[layer_i] = active_k
 
         self.value_cache[layer_i] = active_v
 
@@ -1192,6 +1212,33 @@ class TurboQuantDecodeAttentionPatcher:
         assert state.scalar_lane_words_storage is not None
         assert state.qjl_lane_nibbles_storage is not None
         assert state.residual_norms_storage is not None
+
+        if os.environ.get("TQ_DEBUG_APPEND_FUNCTION_ENTRY", "0") == "1":
+            try:
+                print("[DEBUG append function entry]", {
+                    "layer_idx": int(getattr(state, "layer_idx", -1)),
+                    "append_calls": int(getattr(state, "append_calls", -1)),
+                    "compressed_cache_len_before": int(getattr(state, "compressed_cache_len", -1)),
+                    "scalar_new_shape": list(scalar_new.shape),
+                    "qjl_new_shape": list(qjl_new.shape),
+                    "norms_new_shape": list(norms_new.shape),
+                    "scalar_new_dtype": str(scalar_new.dtype),
+                    "qjl_new_dtype": str(qjl_new.dtype),
+                    "norms_new_dtype": str(norms_new.dtype),
+                }, flush=True)
+            except Exception as e:
+                print("[DEBUG append function entry ERROR]", repr(e), flush=True)
+
+        if os.environ.get("TQ_SKIP_COMPRESSED_K_APPEND", "0") == "1":
+            try:
+                print("[DEBUG skip compressed K append]", {
+                    "layer_idx": int(getattr(state, "layer_idx", -1)),
+                    "compressed_cache_len": int(getattr(state, "compressed_cache_len", -1)),
+                    "scalar_new_shape": list(scalar_new.shape),
+                }, flush=True)
+            except Exception:
+                pass
+            return
 
         start = int(state.compressed_cache_len)
         add = int(scalar_new.shape[-2])
@@ -1802,6 +1849,33 @@ class TurboQuantDecodeAttentionPatcher:
                         lambda: fused_residual_qjl256_pack_cuda(residual, state.sketch),
                     )
                     state.add_component_ms("fused_residual_qjl256_pack_new_k", ms)
+
+                    if (
+                        os.environ.get("TQ_DEBUG_FUSED_QJL256_APPEND_PARITY", "").strip() == "1"
+                        and int(state.layer_idx) in {0, 2}
+                        and int(state.append_calls) < 2
+                    ):
+                        (residual_signs_ref, residual_norms_ref) = qjl_encode_residual(
+                            residual, state.sketch
+                        )
+                        qjl_new_ref = _pack_qjl_signs_fast(residual_signs_ref)
+                        print(
+                            "[DEBUG fused qjl256 append parity]",
+                            {
+                                "layer_idx": int(state.layer_idx),
+                                "append_calls": int(state.append_calls),
+                                "residual_shape": list(residual.shape),
+                                "qjl_fused_shape": list(qjl_new_fused.shape),
+                                "qjl_ref_shape": list(qjl_new_ref.shape),
+                                "qjl_same": bool(torch.equal(qjl_new_fused, qjl_new_ref)),
+                                "qjl_max_abs": float((qjl_new_fused.to(torch.int16) - qjl_new_ref.to(torch.int16)).abs().max().item()),
+                                "qjl_mean_abs": float((qjl_new_fused.to(torch.int16) - qjl_new_ref.to(torch.int16)).abs().float().mean().item()),
+                                "norm_max_abs": float((residual_norms_raw - residual_norms_ref).abs().max().item()),
+                                "norm_mean_abs": float((residual_norms_raw - residual_norms_ref).abs().mean().item()),
+                            },
+                            flush=True,
+                        )
+
                     residual_signs_raw = None
                 else:
                     (residual_signs_raw, residual_norms_raw), ms = _profile_cuda_ms(
@@ -1907,10 +1981,49 @@ class TurboQuantDecodeAttentionPatcher:
             )
 
         def _slice_write_preallocated_cache():
+            if os.environ.get("TQ_DEBUG_APPEND_ENCODE_PARITY", "0") == "1":
+                try:
+                    # Recompute reference encode for the just-appended RoPE-applied key
+                    # using the exact same rotation/sketch/centroids as the cache state.
+                    assert state.rotation is not None
+                    assert state.sketch is not None
+                    assert state.centroids is not None
+
+                    k_ref = new_keys.detach().to(torch.float32)
+                    rot_ref = rotate(k_ref, state.rotation)
+                    codes_ref = scalar_quantize(rot_ref, state.centroids)
+                    deq_ref = scalar_dequantize(codes_ref, state.centroids)
+                    residual_ref = rot_ref - deq_ref
+                    signs_ref, norms_ref = qjl_encode_residual(residual_ref, state.sketch)
+                    scalar_ref = pack_scalar_codes_lane_word_4bit(codes_ref).contiguous()
+                    qjl_ref = pack_qjl_signs_lane_nibble(signs_ref).contiguous()
+
+                    def _mdiff(a, b):
+                        if a.shape != b.shape:
+                            return {"shape_a": list(a.shape), "shape_b": list(b.shape), "same_shape": False}
+                        da = (a.detach().to(torch.float32) - b.detach().to(torch.float32)).abs()
+                        return {
+                            "same_shape": True,
+                            "max_abs": float(da.max().item()) if da.numel() else 0.0,
+                            "mean_abs": float(da.mean().item()) if da.numel() else 0.0,
+                        }
+
+                    if int(getattr(state, "layer_idx", -1)) in {0, 7, 28}:
+                        print("[DEBUG append encode parity]", {
+                            "layer_idx": int(getattr(state, "layer_idx", -1)),
+                            "new_keys_shape": list(new_keys.shape),
+                            "new_keys_norm": float(new_keys.detach().float().norm().item()),
+                            "scalar_new_vs_ref": _mdiff(scalar_new, scalar_ref),
+                            "qjl_new_vs_ref": _mdiff(qjl_new, qjl_ref),
+                            "norms_new_vs_ref": _mdiff(norms_new, norms_ref),
+                        }, flush=True)
+                except Exception as e:
+                    print("[DEBUG append encode parity ERROR]", repr(e), flush=True)
+
             self._append_preallocated_compressed_cache(
                 state=state,
                 scalar_new=scalar_new,
-                qjl_new=qjl_new,
+                qjl_new=(qjl_ref if (os.environ.get("TQ_FORCE_APPEND_QJL_REF_FINAL", "0") == "1" and "qjl_ref" in locals()) else qjl_new),
                 norms_new=norms_new,
             )
             return None
@@ -2367,6 +2480,16 @@ class TurboQuantDecodeAttentionPatcher:
             ) = patcher._active_compressed_cache_inputs(state)
 
             def _kernel_call():
+                if os.environ.get("TQ_FORCE_REFERENCE_TQ_LOGITS", "0") == "1":
+                    return (_reference_tq_logits_from_packed(
+                    rotated_queries=rotated_queries,
+                    qjl_projected_queries=qjl_projected_queries,
+                    centroids=state.centroids,
+                    scalar_lane_words=active_scalar_lane_words,
+                    qjl_lane_nibbles=active_qjl_lane_nibbles,
+                    residual_norms=active_residual_norms,
+                    active_kv_len=active_kv_len,
+                    ), "reference_torch_logits")
                 return _try_call_nonfactor_kernel(
                     rotated_queries=rotated_queries,
                     qjl_projected_queries=qjl_projected_queries,
@@ -2599,7 +2722,7 @@ class TurboQuantDecodeAttentionPatcher:
 
             installed.append(
                 {
-                    "layer_idx": int(layer_idx),
+                    "layer_idx": int(getattr(state, "layer_idx", -1)),
                     "name": name,
                     "module_type": type(module).__name__,
                 }
@@ -2736,7 +2859,7 @@ class BaselineDecodeAttentionProfiler:
 
             installed.append(
                 {
-                    "layer_idx": int(layer_idx),
+                    "layer_idx": int(getattr(state, "layer_idx", -1)),
                     "name": name,
                     "module_type": type(module).__name__,
                 }
@@ -2851,12 +2974,7 @@ def _manual_decode_run(
     static_v_cache = None
     if os.environ.get("TQ_STATIC_V_CACHE", "").strip() == "1":
         reserve = int(os.environ.get("TQ_STATIC_V_CACHE_RESERVE_TOKENS", "0") or "0")
-        tq_layers_raw = os.environ.get("TQ_STATIC_V_TQ_LAYERS", "all").strip()
-        if tq_layers_raw.lower() in ("all", "*", ""):
-            tq_layers = set(range(int(getattr(model.config, "num_hidden_layers", 32))))
-        else:
-            tq_layers = {int(x.strip()) for x in tq_layers_raw.split(",") if x.strip()}
-        static_v_cache = TQStaticValueCache(reserve_tokens=reserve, tq_layers=tq_layers)
+        static_v_cache = TQStaticValueCache(reserve_tokens=reserve)
         prefill_outputs = model(
             input_ids=prompt_ids,
             past_key_values=static_v_cache,
@@ -2942,7 +3060,7 @@ def _manual_decode_run(
                 after = layer_cache_after.get(layer_idx, {})
                 layer_rows.append(
                     {
-                        "layer_idx": int(layer_idx),
+                        "layer_idx": int(getattr(state, "layer_idx", -1)),
                         "cache_update_only_ms": float(
                             after.get("cache_update_only", 0.0)
                             - before.get("cache_update_only", 0.0)
@@ -2970,7 +3088,7 @@ def _manual_decode_run(
                 after = layer_post_logits_after.get(layer_idx, {})
                 layer_rows.append(
                     {
-                        "layer_idx": int(layer_idx),
+                        "layer_idx": int(getattr(state, "layer_idx", -1)),
                         "post_logits_softmax_fp32_ms": float(
                             after.get("post_logits_softmax_fp32", 0.0)
                             - before.get("post_logits_softmax_fp32", 0.0)
@@ -3034,6 +3152,156 @@ def _manual_decode_run(
     }
 
 
+
+@torch.no_grad()
+def _teacher_forced_nll_run(
+    model: torch.nn.Module,
+    *,
+    input_ids: torch.Tensor,
+    context_len: int,
+    eval_tokens: int,
+    label: str,
+    component_patcher: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Teacher-forced decode NLL.
+
+    The model is first prefilling input_ids[:, :context_len].
+    Then for eval_tokens steps, it feeds the ground-truth token at each step,
+    and computes NLL for the next ground-truth token.
+
+    This avoids autoregressive trajectory divergence.
+    """
+    if input_ids.device.type != "cuda":
+        raise RuntimeError("Teacher-forced timing expects CUDA input ids.")
+
+    total_needed = int(context_len) + int(eval_tokens) + 1
+    if int(input_ids.shape[1]) < total_needed:
+        raise RuntimeError(
+            f"Need at least context_len + eval_tokens + 1 = {total_needed} tokens, "
+            f"got {input_ids.shape[1]}"
+        )
+
+    prompt_ids = input_ids[:, : int(context_len)].contiguous()
+
+    torch.cuda.synchronize()
+    prefill_start = torch.cuda.Event(enable_timing=True)
+    prefill_end = torch.cuda.Event(enable_timing=True)
+
+    prefill_start.record()
+    if os.environ.get("TQ_STATIC_V_CACHE", "").strip() == "1":
+        reserve = int(os.environ.get("TQ_STATIC_V_CACHE_RESERVE_TOKENS", "0") or "0")
+        static_v_cache = TQStaticValueCache(reserve_tokens=reserve)
+        outputs = model(
+            input_ids=prompt_ids,
+            past_key_values=static_v_cache,
+            use_cache=True,
+        )
+    else:
+        outputs = model(input_ids=prompt_ids, use_cache=True)
+    prefill_end.record()
+    torch.cuda.synchronize()
+
+    prefill_ms = float(prefill_start.elapsed_time(prefill_end))
+    logits, past = _extract_logits_and_past(outputs)
+
+    # NLL for first target after prefill, using last prefill logits.
+    losses = []
+    top1_hits = []
+    top5_hits = []
+
+    def _accumulate(
+        logits_step: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        token_idx: int,
+        feed_pos: int | None,
+        target_pos: int,
+        teacher_token: torch.Tensor | None,
+    ):
+        # logits_step: [1, vocab], target: [1]
+        log_probs = torch.log_softmax(logits_step.float(), dim=-1)
+        nll = -log_probs.gather(-1, target.view(-1, 1)).squeeze(-1)
+        losses.append(float(nll.detach().cpu().item()))
+
+        top5 = torch.topk(logits_step, k=min(5, logits_step.shape[-1]), dim=-1).indices
+        top1_hits.append(int(top5[:, 0].eq(target).detach().cpu().item()))
+        top5_hits.append(int(top5.eq(target.view(-1, 1)).any(dim=-1).detach().cpu().item()))
+
+        if os.environ.get("TQ_DEBUG_TEACHER_STEP_ALIGNMENT", "0") == "1":
+            try:
+                tq_summary = {}
+                patcher_obj = component_patcher if component_patcher is not None else None
+                states = getattr(patcher_obj, "states", {}) if patcher_obj is not None else {}
+                for li in [0, 7, 28, 31]:
+                    st = states.get(li) if isinstance(states, dict) else None
+                    if st is not None:
+                        tq_summary[str(li)] = {
+                            "compressed_cache_len": int(getattr(st, "compressed_cache_len", -1)),
+                            "append_calls": int(getattr(st, "append_calls", -1)),
+                            "last_kv_len": int(getattr(st, "last_kv_len", -1)),
+                        }
+
+                print("[DEBUG teacher step alignment]", {
+                    "label": str(label),
+                    "token_idx": int(token_idx),
+                    "feed_pos": None if feed_pos is None else int(feed_pos),
+                    "target_pos": int(target_pos),
+                    "teacher_token": (
+                        None if teacher_token is None
+                        else int(teacher_token.detach().view(-1)[0].item())
+                    ),
+                    "target_token": int(target.detach().view(-1)[0].item()),
+                    "loss": float(nll.detach().cpu().item()),
+                    "top1_hit": int(top1_hits[-1]),
+                    "top5_hit": int(top5_hits[-1]),
+                    "tq_summary": tq_summary,
+                }, flush=True)
+            except Exception as e:
+                print("[DEBUG teacher step alignment ERROR]", repr(e), flush=True)
+
+    first_target = input_ids[:, int(context_len)]
+    _accumulate(logits[:, -1, :], first_target, token_idx=0, feed_pos=None, target_pos=int(context_len), teacher_token=None)
+
+    step_ms = []
+
+    # Feed ground-truth tokens, not generated tokens.
+    for i in range(int(eval_tokens) - 1):
+        feed_pos = int(context_len) + i
+        target_pos = feed_pos + 1
+
+        teacher_token = input_ids[:, feed_pos:feed_pos + 1].contiguous()
+        target = input_ids[:, target_pos].contiguous()
+
+        def _call():
+            os.environ["TQ_CURRENT_DECODE_PHASE"] = "timed"
+            return model(input_ids=teacher_token, past_key_values=past, use_cache=True)
+
+        outputs, dt = _event_time_ms(_call)
+        step_ms.append(float(dt))
+
+        logits, past = _extract_logits_and_past(outputs)
+        _accumulate(logits[:, -1, :], target, token_idx=i + 1, feed_pos=feed_pos, target_pos=target_pos, teacher_token=teacher_token)
+
+    mean_nll = float(sum(losses) / max(1, len(losses)))
+    ppl = float(torch.exp(torch.tensor(mean_nll)).item())
+
+    return {
+        "label": label,
+        "context_len": int(context_len),
+        "eval_tokens": int(eval_tokens),
+        "prefill_ms": float(prefill_ms),
+        "decode_step_ms": _summary_ms(step_ms),
+        "mean_nll": mean_nll,
+        "ppl": ppl,
+        "top1_acc": float(sum(top1_hits) / max(1, len(top1_hits))),
+        "top5_acc": float(sum(top5_hits) / max(1, len(top5_hits))),
+        "losses": losses,
+        "top1_hits": top1_hits,
+        "top5_hits": top5_hits,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Decode-only end-to-end timing for TurboQuant CUDA attention-logits replacement."
@@ -3045,6 +3313,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt_len", type=int, default=2048)
     p.add_argument("--timed_decode_tokens", type=int, default=128)
     p.add_argument("--prime_decode_tokens", type=int, default=1)
+    p.add_argument("--context_len", type=int, default=None)
+    p.add_argument("--eval_tokens", type=int, default=128)
     p.add_argument("--replace_layers", default="all")
     p.add_argument("--scalar_bits", type=int, default=4)
     p.add_argument("--qjl_dim", type=int, default=128)
@@ -3106,7 +3376,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    os.environ["TQ_STATIC_V_TQ_LAYERS"] = str(args.replace_layers)
     device = torch.device(args.device)
     if device.type != "cuda":
         raise SystemExit("This benchmark is intended for CUDA; pass --device cuda:0.")
@@ -3217,12 +3486,14 @@ def main() -> None:
                 profile_layers=_parse_replace_layers(args.replace_layers),
             )
 
-        baseline = _manual_decode_run(
+        context_len = int(args.context_len or args.prompt_len)
+        baseline = _teacher_forced_nll_run(
             model,
-            prompt_ids=prompt_ids,
-            timed_decode_tokens=int(args.timed_decode_tokens),
-            prime_decode_tokens=int(args.prime_decode_tokens),
-            label="baseline_original_attention_decode",
+            input_ids=prompt_ids,
+            context_len=context_len,
+            eval_tokens=int(args.eval_tokens),
+            label="baseline_original_attention_teacher_forced_nll",
+            component_patcher=None,
         )
 
         if bool(args.profile_components):
@@ -3282,12 +3553,13 @@ def main() -> None:
     installed = patcher.install(model, replace_layers=_parse_replace_layers(args.replace_layers))
     print(json.dumps({"installed_decode_replacement_forwards": installed}, indent=2))
 
-    replacement = _manual_decode_run(
+    context_len = int(args.context_len or args.prompt_len)
+    replacement = _teacher_forced_nll_run(
         model,
-        prompt_ids=prompt_ids,
-        timed_decode_tokens=int(args.timed_decode_tokens),
-        prime_decode_tokens=int(args.prime_decode_tokens),
-        label="turboquant_cuda_decode_attention_replacement",
+        input_ids=prompt_ids,
+        context_len=context_len,
+        eval_tokens=int(args.eval_tokens),
+        label="turboquant_cuda_teacher_forced_nll_replacement",
         component_patcher=patcher,
     )
     patcher_summary = patcher.summary()
@@ -3295,56 +3567,51 @@ def main() -> None:
     print(json.dumps({"patcher_summary": patcher_summary}, indent=2))
     patcher.restore()
 
-    r_mean = float(replacement["decode_ms_per_token"]["mean_ms"])
     if baseline is not None:
-        b_mean = float(baseline["decode_ms_per_token"]["mean_ms"])
-        baseline_tokens = baseline["generated_token_ids"]
-        replacement_tokens = replacement["generated_token_ids"]
-        aligned = min(len(baseline_tokens), len(replacement_tokens))
-        exact_matches = sum(int(baseline_tokens[i] == replacement_tokens[i]) for i in range(aligned))
-        latency_cmp = {
-            "baseline_mean_ms_per_token": b_mean,
-            "replacement_mean_ms_per_token": r_mean,
-            "replacement_over_baseline": float(r_mean / b_mean) if b_mean > 0 else None,
-            "baseline_over_replacement_speedup": float(b_mean / r_mean) if r_mean > 0 else None,
-            "baseline_tokens_per_sec": baseline["tokens_per_sec"],
-            "replacement_tokens_per_sec": replacement["tokens_per_sec"],
-        }
-        token_cmp = {
-            "aligned_tokens": int(aligned),
-            "exact_match_count": int(exact_matches),
-            "exact_match_ratio": float(exact_matches / aligned) if aligned > 0 else None,
+        comparisons = {
+            "teacher_forced_nll": {
+                "baseline_mean_nll": float(baseline["mean_nll"]),
+                "replacement_mean_nll": float(replacement["mean_nll"]),
+                "delta_nll": float(replacement["mean_nll"] - baseline["mean_nll"]),
+                "baseline_ppl": float(baseline["ppl"]),
+                "replacement_ppl": float(replacement["ppl"]),
+                "ppl_ratio": float(replacement["ppl"] / baseline["ppl"]),
+                "baseline_top1_acc": float(baseline["top1_acc"]),
+                "replacement_top1_acc": float(replacement["top1_acc"]),
+                "baseline_top5_acc": float(baseline["top5_acc"]),
+                "replacement_top5_acc": float(replacement["top5_acc"]),
+            },
+            "scope": {
+                "metric": "teacher_forced_next_token_nll",
+                "trajectory": "ground_truth_tokens",
+                "baseline_skipped": False,
+            },
         }
     else:
-        latency_cmp = {
-            "baseline_mean_ms_per_token": None,
-            "replacement_mean_ms_per_token": r_mean,
-            "replacement_over_baseline": None,
-            "baseline_over_replacement_speedup": None,
-            "baseline_tokens_per_sec": None,
-            "replacement_tokens_per_sec": replacement["tokens_per_sec"],
-        }
-        token_cmp = {
-            "aligned_tokens": None,
-            "exact_match_count": None,
-            "exact_match_ratio": None,
+        comparisons = {
+            "teacher_forced_nll": {
+                "baseline_mean_nll": None,
+                "replacement_mean_nll": float(replacement["mean_nll"]),
+                "delta_nll": None,
+                "baseline_ppl": None,
+                "replacement_ppl": float(replacement["ppl"]),
+                "ppl_ratio": None,
+                "baseline_top1_acc": None,
+                "replacement_top1_acc": float(replacement["top1_acc"]),
+                "baseline_top5_acc": None,
+                "replacement_top5_acc": float(replacement["top5_acc"]),
+            },
+            "scope": {
+                "metric": "teacher_forced_next_token_nll",
+                "trajectory": "ground_truth_tokens",
+                "baseline_skipped": True,
+            },
         }
 
-    comparisons = {
-        "steady_state_decode_latency": latency_cmp,
-        "generated_token_agreement": token_cmp,
-        "scope": {
-            "prefill_attention": "original_attention",
-            "timed_decode_attention": "turboquant_cuda_nonfactor_combined_logits",
-            "prime_step_excluded_from_steady_state": True,
-            "compressed_cache_append": "Python/PyTorch glue with packed tensor concatenation",
-            "baseline_skipped": bool(args.skip_baseline),
-        },
-    }
     print(json.dumps({"comparisons": comparisons}, indent=2))
 
     payload = {
-        "benchmark": "turboquant_decode_attention_cuda_true_timing",
+        "benchmark": "teacher_forced_turboquant_nll",
         "config": vars(args),
         "baseline": baseline,
         "replacement": replacement,

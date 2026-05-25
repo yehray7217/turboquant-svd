@@ -104,3 +104,30 @@ def qjl_residual_logits(
         residual_signs.to(torch.float32),
     )
     return scale * signed_dot * residual_norms.to(torch.float32).unsqueeze(-2)
+
+
+def make_rademacher_sketch(
+    dim: int,
+    sketch_dim: int,
+    *,
+    seed: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """
+    Rademacher sketch with entries ±1/sqrt(sketch_dim).
+
+    Shape follows make_gaussian_sketch: [sketch_dim, dim].
+    """
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+    signs = torch.randint(
+        0,
+        2,
+        (int(sketch_dim), int(dim)),
+        generator=gen,
+        device=device,
+        dtype=torch.int8,
+    )
+    sketch = signs.to(torch.float32).mul_(2.0).sub_(1.0)
+    sketch = sketch / (float(sketch_dim) ** 0.5)
+    return sketch.contiguous()

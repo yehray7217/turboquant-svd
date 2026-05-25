@@ -65,10 +65,7 @@ def _extract_layer_input_hidden(
     if attention_mask is not None:
         kwargs["attention_mask"] = attention_mask
 
-    if hasattr(model, "model"):
-        outputs = model.model(**kwargs)
-    else:
-        outputs = model(**kwargs)
+    outputs = model(**kwargs)
     hidden_states = outputs.hidden_states
     if hidden_states is None:
         raise RuntimeError("Model did not return hidden_states.")

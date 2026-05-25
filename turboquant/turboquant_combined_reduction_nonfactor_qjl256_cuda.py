@@ -15,7 +15,7 @@ def _load_ext():
         src = (
             Path(__file__).resolve().parent
             / "csrc"
-            / "turboquant_combined_reduction_nonfactor_ablation_cuda.cu"
+            / "turboquant_combined_reduction_nonfactor_qjl256_cuda.cu"
         )
         _EXT = load(
             name="true_turboquant_combined_reduction_nonfactor_ablation_cuda_ext",
@@ -28,7 +28,7 @@ def _load_ext():
 
 
 @torch.no_grad()
-def turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_cuda(
+def turboquant_full_4bit_lane_word_lane_nibble_qjl256_combined_reduction_logits_b1q1_d128_cuda(
     *,
     rotated_queries: torch.Tensor,
     lane_word_scalar_codes: torch.Tensor,
@@ -44,7 +44,7 @@ def turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_
         else int(active_kv_len)
     )
 
-    return _load_ext().turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_cuda(
+    return _load_ext().turboquant_full_4bit_lane_word_lane_nibble_qjl256_combined_reduction_logits_b1q1_d128_cuda(
         rotated_queries.contiguous().to(torch.float32),
         lane_word_scalar_codes.contiguous(),
         qjl_projected_queries.contiguous().to(torch.float32),

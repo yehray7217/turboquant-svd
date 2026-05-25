@@ -43,9 +43,6 @@ from typing import Any, Dict, Optional, Tuple
 import click
 import torch
 
-from modules.svd_hf_registry import register_svdllama_auto_classes
-register_svdllama_auto_classes()
-
 
 # Ensure local imports work when running from outside this directory.
 _THIS_DIR = Path(__file__).resolve().parent

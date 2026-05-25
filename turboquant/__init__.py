@@ -10,6 +10,7 @@ from .scalar_quant import (
 )
 from .qjl import (
     make_gaussian_sketch,
+    make_rademacher_sketch,
     qjl_encode_residual,
     qjl_project_query,
     qjl_residual_logits,
@@ -29,6 +30,7 @@ __all__ = [
     "scalar_quantize",
     "scalar_dequantize",
     "make_gaussian_sketch",
+    "make_rademacher_sketch",
     "qjl_encode_residual",
     "qjl_project_query",
     "qjl_residual_logits",

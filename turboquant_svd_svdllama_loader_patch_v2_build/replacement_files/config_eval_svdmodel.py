@@ -43,9 +43,6 @@ from typing import Any, Dict, Optional, Tuple
 import click
 import torch
 
-from modules.svd_hf_registry import register_svdllama_auto_classes
-register_svdllama_auto_classes()
-
 
 # Ensure local imports work when running from outside this directory.
 _THIS_DIR = Path(__file__).resolve().parent
@@ -241,17 +238,8 @@ def apply_svd_ranks_inplace(
     rank_dict: Dict[str, int],
     *,
     dtype: torch.dtype = torch.float16,
-    svd_device: Optional[str] = None,
-    progress: bool = True,
 ) -> torch.nn.Module:
-    """Replace matched nn.Linear modules with SVDLinear using specified ranks.
-
-    If ``svd_device`` is CUDA, only the per-layer SVD workspace is moved to GPU.
-    The base model stays CPU-resident during rebuild, and the rebuilt model can
-    be moved to the inference device afterward by the caller.
-    """
-    import time
-
+    """Replace matched nn.Linear modules with SVDLinear using specified ranks."""
     try:
         from svd_linear import SVDLinear  # project-local
     except Exception as e:
@@ -259,6 +247,7 @@ def apply_svd_ranks_inplace(
 
     rank_dict_norm = {_normalize_key(k): int(v) for k, v in rank_dict.items()}
 
+    # Parent module references to replace children.
     name_to_parent: Dict[str, Tuple[torch.nn.Module, str]] = {}
     named_modules = dict(model.named_modules())
     for name, _ in model.named_modules():
@@ -272,48 +261,21 @@ def apply_svd_ranks_inplace(
             child_name = name
         name_to_parent[name] = (parent, child_name)
 
-    targets: list[tuple[str, torch.nn.Linear, int, int]] = []
+    replaced = 0
     for name, mod in list(model.named_modules()):
         if not isinstance(mod, torch.nn.Linear):
             continue
         key = _normalize_key(name)
         if key not in rank_dict_norm:
             continue
-        rank = int(rank_dict_norm[key])
-        full_rank = int(min(mod.in_features, mod.out_features))
-        if rank >= full_rank:
+
+        r = int(rank_dict_norm[key])
+        full_rank = min(mod.in_features, mod.out_features)
+        if r >= full_rank:
             continue
-        targets.append((name, mod, rank, full_rank))
-
-    if svd_device is not None:
-        svd_device = str(svd_device)
-        if svd_device.startswith("cuda") and not torch.cuda.is_available():
-            raise RuntimeError(f"svd_device={svd_device!r} requested, but CUDA is unavailable.")
-
-    if progress:
-        click.secho(
-            f"[Rebuild:svd] Target Linear layers: {len(targets)} | SVD device: {svd_device or 'module_device'}",
-            fg="cyan",
-        )
-
-    replaced = 0
-    total_start = time.perf_counter()
-
-    for idx, (name, mod, rank, full_rank) in enumerate(targets, start=1):
-        out_f = int(mod.out_features)
-        in_f = int(mod.in_features)
-        layer_start = time.perf_counter()
 
         new_mod = SVDLinear.from_linear_rank(
-            mod,
-            name=name,
-            rank=rank,
-            act_aware=False,
-            succinct=False,
-            sigma_fuse="UV",
-            svd_device=svd_device,
-            verbose_rank=False,
-            verbose_module=False,
+            mod, name=name, rank=r, act_aware=False, succinct=False, sigma_fuse="UV"
         )
         new_mod = new_mod.to(dtype)
 
@@ -321,26 +283,7 @@ def apply_svd_ranks_inplace(
         setattr(parent, child, new_mod)
         replaced += 1
 
-        if svd_device is not None and str(svd_device).startswith("cuda"):
-            torch.cuda.synchronize(torch.device(str(svd_device)))
-            torch.cuda.empty_cache()
-
-        elapsed = time.perf_counter() - layer_start
-        if progress:
-            click.secho(
-                (
-                    f"[Rebuild:svd] [{idx:03d}/{len(targets):03d}] "
-                    f"{name} W=({out_f},{in_f}) rank={rank}/{full_rank} "
-                    f"elapsed={elapsed:.2f}s"
-                ),
-                fg="green",
-            )
-
-    total_elapsed = time.perf_counter() - total_start
-    click.secho(
-        f"[Rebuild:svd] Replaced {replaced} Linear layers with SVDLinear in {total_elapsed:.2f}s.",
-        fg="green",
-    )
+    click.secho(f"[Rebuild:svd] Replaced {replaced} Linear layers with SVDLinear.", fg="green")
     return model
 
 

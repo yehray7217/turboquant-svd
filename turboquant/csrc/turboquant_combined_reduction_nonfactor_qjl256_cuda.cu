@@ -10,7 +10,7 @@ namespace {
 constexpr int THREADS = 256;
 constexpr int WARPS_PER_BLOCK = 8;
 constexpr int D = 128;
-constexpr int M = 128;
+constexpr int M = 256;
 constexpr int SCALAR_LEVELS = 16;
 constexpr int LANE_WORD_PACKED_CODE_BYTES = D / 2;  // 64 bytes/token/head
 constexpr int LANE_NIBBLE_SIGN_BYTES = M / 8;       // 16 bytes/token/head
@@ -53,7 +53,7 @@ Goal:
   determine whether factor LUT remains worth its highly uncoalesced global
   loads after the reduction tree was cut from 2 to 1.
 */
-__global__ void turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_kernel(
+__global__ void turboquant_full_4bit_lane_word_lane_nibble_qjl256_combined_reduction_logits_b1q1_d128_kernel(
     const float* __restrict__ rotated_queries,
     const uint8_t* __restrict__ lane_word_scalar_codes,
     const float* __restrict__ qjl_projected_queries,
@@ -162,7 +162,7 @@ void validate_lane_nibble_signs(torch::Tensor signs) {
         signs.dim() == 4 &&
         signs.size(0) == 1 &&
         signs.size(3) == LANE_NIBBLE_SIGN_BYTES,
-        "lane_nibble_qjl_signs must be [1,H,T,16]"
+        "lane_nibble_qjl_signs must be [1,H,T,32]"
     );
 }
 
@@ -187,7 +187,7 @@ void validate_centroids(torch::Tensor centroids) {
 
 } // namespace
 
-torch::Tensor turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_cuda(
+torch::Tensor turboquant_full_4bit_lane_word_lane_nibble_qjl256_combined_reduction_logits_b1q1_d128_cuda(
     torch::Tensor rotated_queries,
     torch::Tensor lane_word_scalar_codes,
     torch::Tensor qjl_projected_queries,
@@ -233,7 +233,7 @@ torch::Tensor turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reducti
     const dim3 block(THREADS, 1, 1);
     const dim3 grid((active_T + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, H, 1);
 
-    turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_kernel<<<grid, block>>>(
+    turboquant_full_4bit_lane_word_lane_nibble_qjl256_combined_reduction_logits_b1q1_d128_kernel<<<grid, block>>>(
         rotated_queries.contiguous().data_ptr<float>(),
         lane_word_scalar_codes.contiguous().data_ptr<uint8_t>(),
         qjl_projected_queries.contiguous().data_ptr<float>(),
@@ -251,8 +251,8 @@ torch::Tensor turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reducti
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
-        "turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_cuda",
-        &turboquant_full_4bit_lane_word_lane_nibble_qjl128_combined_reduction_logits_b1q1_d128_cuda,
+        "turboquant_full_4bit_lane_word_lane_nibble_qjl256_combined_reduction_logits_b1q1_d128_cuda",
+        &turboquant_full_4bit_lane_word_lane_nibble_qjl256_combined_reduction_logits_b1q1_d128_cuda,
         "Non-factor-LUT full TurboQuant with combined scalar/QJL warp reduction"
     );
 }
