@@ -22,3 +22,8 @@ eval_results/
 .vscode/
 .idea/
 EOF
+# Local rebuilt SVD checkpoints / runtime artifacts
+svd_models_uniform_whiten_08/
+runs/
+*.broken_newline_*
+*.bak_before_*
