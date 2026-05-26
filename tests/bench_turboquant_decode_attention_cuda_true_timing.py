@@ -2215,12 +2215,22 @@ class TurboQuantDecodeAttentionPatcher:
                         raise RuntimeError("dynamic_v_no_k requires HF-style value_cache.")
 
                     old_v = past.value_cache[layer_i]
+
+                    # dynamic_v_no_k_tail_cache_no_cat:
+                    # Avoid torch.cat([old_v, value_states_new]) at long context.
+                    # Keep the large prefill V as base_v and accumulate only generated
+                    # token V in a tiny per-layer tail.
                     if old_v is None:
                         active_v = value_states_new
+                        dynamic_v_tail = None
                     else:
-                        active_v = torch.cat([old_v, value_states_new], dim=-2)
-
-                    past.value_cache[layer_i] = active_v
+                        prev_tail = getattr(state, "dynamic_v_tail", None)
+                        if prev_tail is None:
+                            dynamic_v_tail = value_states_new
+                        else:
+                            dynamic_v_tail = torch.cat([prev_tail, value_states_new], dim=-2)
+                        setattr(state, "dynamic_v_tail", dynamic_v_tail)
+                        active_v = old_v
 
                     old_k = past.key_cache[layer_i]
                     if old_k is None:
@@ -2228,7 +2238,7 @@ class TurboQuantDecodeAttentionPatcher:
                     else:
                         full_keys_prefix = old_k
 
-                    return full_keys_prefix, active_v, past
+                    return full_keys_prefix, (active_v, dynamic_v_tail), past
 
                 return _cache_update(
                     module=self_module,
@@ -2474,8 +2484,37 @@ class TurboQuantDecodeAttentionPatcher:
                     flush=True,
                 )
 
+            def _value_dtype(values_obj):
+                if isinstance(values_obj, tuple):
+                    base_v, tail_v = values_obj
+                    return base_v.dtype
+                return values_obj.dtype
+
+            def _cast_values_to_dtype(values_obj, dtype):
+                if isinstance(values_obj, tuple):
+                    base_v, tail_v = values_obj
+                    base_v = base_v.to(dtype)
+                    if tail_v is not None:
+                        tail_v = tail_v.to(dtype)
+                    return base_v, tail_v
+                return values_obj.to(dtype)
+
+            def _matmul_probs_v_dynamic_tail(attn_probs_local, values_obj):
+                if isinstance(values_obj, tuple):
+                    base_v, tail_v = values_obj
+                    base_len = int(base_v.shape[-2])
+                    out = torch.matmul(attn_probs_local[..., :base_len], base_v)
+                    if tail_v is not None and int(tail_v.shape[-2]) > 0:
+                        tail_len = int(tail_v.shape[-2])
+                        out = out + torch.matmul(
+                            attn_probs_local[..., base_len:base_len + tail_len],
+                            tail_v,
+                        )
+                    return out
+                return torch.matmul(attn_probs_local, values_obj)
+
             def _probs_cast_only():
-                return attn_probs_fp32.to(full_values.dtype)
+                return attn_probs_fp32.to(_value_dtype(full_values))
 
             attn_probs, ms = _profile_cuda_ms(
                 patcher.profile_components,
@@ -2484,7 +2523,7 @@ class TurboQuantDecodeAttentionPatcher:
             state.add_component_ms("post_logits_probs_cast_to_v_dtype", ms)
 
             def _values_cast_only():
-                return full_values.to(attn_probs.dtype)
+                return _cast_values_to_dtype(full_values, attn_probs.dtype)
 
             full_values_for_matmul, ms = _profile_cuda_ms(
                 patcher.profile_components,
@@ -2493,7 +2532,7 @@ class TurboQuantDecodeAttentionPatcher:
             state.add_component_ms("post_logits_values_cast_to_probs_dtype", ms)
 
             def _matmul_probs_v_only():
-                return torch.matmul(attn_probs, full_values_for_matmul)
+                return _matmul_probs_v_dynamic_tail(attn_probs, full_values_for_matmul)
 
             attn_output_heads, ms = _profile_cuda_ms(
                 patcher.profile_components,
