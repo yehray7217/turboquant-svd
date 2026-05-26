@@ -2252,18 +2252,15 @@ class TurboQuantDecodeAttentionPatcher:
             def _repeat_kv_states():
                 dense_cache_mode = os.environ.get("TQ_DENSE_CACHE_MODE", "kv").strip().lower()
 
-                if dense_cache_mode == "dynamic_v_no_k":
-                    # Low-memory long-context mode:
-                    # - full_keys_kv is only needed for first compressed prefix build.
-                    # - num_kv_groups is 1 for the current LLaMA config, so avoid an
-                    #   unnecessary contiguous duplicate of full prefix K.
-                    # - TQ logits use compressed K after build; dense full_keys is not
-                    #   needed for logits.
-                    if int(num_kv_groups) != 1:
-                        full_keys_local = _repeat_kv(full_keys_kv, num_kv_groups)
-                    else:
-                        full_keys_local = full_keys_kv
+                # repeat_kv_noop_fastpath_groups1:
+                # For MHA, num_key_value_heads == num_attention_heads, so num_kv_groups == 1.
+                # In that case _repeat_kv is a no-op and the following .contiguous()
+                # calls can create large, unnecessary copies.
+                if int(num_kv_groups) == 1:
+                    return full_keys_kv, full_values_kv, key_states_new
 
+                if dense_cache_mode == "dynamic_v_no_k":
+                    full_keys_local = _repeat_kv(full_keys_kv, num_kv_groups)
                     full_values_local = _repeat_kv(full_values_kv, num_kv_groups).contiguous()
                     new_keys_expanded_local = _repeat_kv(key_states_new, num_kv_groups).contiguous()
                     return full_keys_local, full_values_local, new_keys_expanded_local
