@@ -4,6 +4,12 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+try:
+    from modules.svd_hf_registry import register_svdllama_auto_classes
+    register_svdllama_auto_classes()
+except Exception as e:
+    print(f"[WARN] failed to register svdllama auto classes: {type(e).__name__}: {e}", flush=True)
+
 def parse_args():
     ap = argparse.ArgumentParser(description="Baseline perplexity evaluation (no compression / no precompute).")
     ap.add_argument("--model_id", required=True)

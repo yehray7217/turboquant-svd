@@ -393,7 +393,16 @@ class TurboQuantAttentionReplacement:
             )
 
         if state.centroids is None:
-            levels = 1 << int(self.scalar_bits)
+            effective_scalar_bits = int(os.environ.get("TQ_EFFECTIVE_SCALAR_BITS", str(self.scalar_bits)))
+            if effective_scalar_bits <= 0:
+                raise RuntimeError(f"Invalid TQ_EFFECTIVE_SCALAR_BITS={effective_scalar_bits}")
+            if effective_scalar_bits > int(self.scalar_bits):
+                raise RuntimeError(
+                    f"TQ_EFFECTIVE_SCALAR_BITS={effective_scalar_bits} exceeds scalar_bits={self.scalar_bits}"
+                )
+
+            levels = 1 << int(effective_scalar_bits)
+            container_levels = 1 << int(self.scalar_bits)
             rotation = state.rotation
             rotated_keys = torch.matmul(
                 keys_for_fit.reshape(-1, int(head_dim)).to(torch.float32),
@@ -408,6 +417,15 @@ class TurboQuantAttentionReplacement:
                 max_samples=int(self.max_codebook_samples),
                 seed=self.codebook_seed + int(state.layer_idx),
             ).contiguous()
+
+            # Quality-probe mode:
+            # Fit fewer scalar levels, but pad centroids back to the existing
+            # scalar_bits container size so current 4-bit reference/decode paths
+            # can still index centroids safely.
+            if int(levels) < int(container_levels):
+                pad = state.centroids[-1:].expand(int(container_levels) - int(levels))
+                state.centroids = torch.cat([state.centroids, pad], dim=0).contiguous()
+
             state.fit_calls += 1
 
             if self.verbose_first_fit:
@@ -422,6 +440,9 @@ class TurboQuantAttentionReplacement:
                             "centroids_max": float(state.centroids.max().item()),
                             "fit_key_rows": int(rotated_keys.shape[0]),
                             "scalar_bits": int(self.scalar_bits),
+                            "effective_scalar_bits": int(effective_scalar_bits),
+                            "levels": int(levels),
+                            "container_levels": int(container_levels),
                             "qjl_dim": int(self.qjl_dim),
                         }
                     ),

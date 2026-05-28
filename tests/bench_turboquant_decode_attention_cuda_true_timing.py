@@ -1600,6 +1600,13 @@ class TurboQuantDecodeAttentionPatcher:
 
         inner_profile = bool(self.profile_components and self.profile_append_inner)
 
+        # Default values for branches that do not produce already-packed outputs.
+        # qjl128 fused_rotate_quant_residual_qjl_cuda returns raw codes/signs/norms,
+        # so scalar_new_fused/qjl_new_fused must remain None until packing below.
+        scalar_new_fused = None
+        qjl_new_fused = None
+        norms_new_fused = None
+
         use_fused_append_compressed_k = (
             os.environ.get("TQ_DISABLE_FUSED_APPEND_COMPRESSED_K", "").strip() != "1"
             and os.environ.get("TQ_RESIDUAL_MODE", "full").strip().lower() == "full"
@@ -1885,7 +1892,10 @@ class TurboQuantDecodeAttentionPatcher:
             print(
                 "[DEBUG compressed write shapes]",
                 "codes", tuple(codes.shape), codes.dtype, codes.stride(),
-                "residual_signs", tuple(residual_signs.shape), residual_signs.dtype, residual_signs.stride(),
+                "residual_signs",
+                None if residual_signs is None else tuple(residual_signs.shape),
+                None if residual_signs is None else residual_signs.dtype,
+                None if residual_signs is None else residual_signs.stride(),
                 "norms_new", tuple(norms_new.shape), norms_new.dtype, norms_new.stride(),
                 "scalar_new", tuple(scalar_new.shape), scalar_new.dtype, scalar_new.stride(),
                 "qjl_new", tuple(qjl_new.shape), qjl_new.dtype, qjl_new.stride(),
@@ -2502,6 +2512,24 @@ class TurboQuantDecodeAttentionPatcher:
             def _matmul_probs_v_dynamic_tail(attn_probs_local, values_obj):
                 if isinstance(values_obj, tuple):
                     base_v, tail_v = values_obj
+                    if (
+                        os.environ.get("TQ_DEBUG_VTAIL_SHAPES", "").strip() == "1"
+                        and int(state.layer_idx) == 0
+                        and int(state.append_calls) < 8
+                    ):
+                        print(
+                            "[DEBUG vtail matmul]",
+                            {
+                                "layer": int(state.layer_idx),
+                                "append_calls": int(state.append_calls),
+                                "attn_probs": list(attn_probs_local.shape),
+                                "base_v": list(base_v.shape),
+                                "tail_v": None if tail_v is None else list(tail_v.shape),
+                                "base_len": int(base_v.shape[-2]),
+                                "tail_len": 0 if tail_v is None else int(tail_v.shape[-2]),
+                            },
+                            flush=True,
+                        )
                     base_len = int(base_v.shape[-2])
                     out = torch.matmul(attn_probs_local[..., :base_len], base_v)
                     if tail_v is not None and int(tail_v.shape[-2]) > 0:
@@ -2510,6 +2538,31 @@ class TurboQuantDecodeAttentionPatcher:
                             attn_probs_local[..., base_len:base_len + tail_len],
                             tail_v,
                         )
+
+                    if (
+                        os.environ.get("TQ_DEBUG_VTAIL_PARITY", "").strip() == "1"
+                        and int(state.layer_idx) == 0
+                        and int(state.append_calls) < 6
+                        and tail_v is not None
+                    ):
+                        ref_v = torch.cat([base_v, tail_v], dim=-2)
+                        ref = torch.matmul(attn_probs_local, ref_v)
+                        diff = (out - ref).float().abs()
+                        print(
+                            "[DEBUG vtail parity]",
+                            {
+                                "layer": int(state.layer_idx),
+                                "append_calls": int(state.append_calls),
+                                "out_shape": list(out.shape),
+                                "ref_shape": list(ref.shape),
+                                "max_abs": float(diff.max().item()),
+                                "mean_abs": float(diff.mean().item()),
+                                "out_norm": float(out.float().norm().item()),
+                                "ref_norm": float(ref.float().norm().item()),
+                            },
+                            flush=True,
+                        )
+
                     return out
                 return torch.matmul(attn_probs_local, values_obj)
 
