@@ -339,9 +339,313 @@ class LayerTQState:
     rotation: Optional[torch.Tensor] = None
     sketch: Optional[torch.Tensor] = None
     centroids: Optional[torch.Tensor] = None
+    v_rotation: Optional[torch.Tensor] = None
+    v_centroids: Optional[torch.Tensor] = None
+    v_qjl_sketch: Optional[torch.Tensor] = None
+    v_fit_calls: int = 0
     fit_calls: int = 0
     replace_calls: int = 0
     last_info: Optional[dict[str, Any]] = None
+
+
+def _fake_quant_v_symmetric_per_token(v: torch.Tensor, *, bits: int) -> torch.Tensor:
+    """
+    Per [B,H,T] symmetric fake quant over D.
+    This simulates storing V codes plus one scale per token/head.
+    """
+    if bits <= 0:
+        return v
+    qmax = (1 << (bits - 1)) - 1
+    if qmax <= 0:
+        qmax = 1
+    vf = v.to(torch.float32)
+    scale = vf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / float(qmax)
+    q = torch.round(vf / scale).clamp(-qmax, qmax)
+    recon = q * scale
+    return recon.to(v.dtype)
+
+
+def _quantize_to_centroids_chunked(x: torch.Tensor, centroids: torch.Tensor, *, chunk: int = 1 << 20) -> torch.Tensor:
+    """
+    Quantize x to nearest centroid. Chunked to avoid materializing [N, levels] too large.
+    """
+    flat = x.reshape(-1).to(torch.float32)
+    c = centroids.to(torch.float32).reshape(1, -1)
+    out = torch.empty_like(flat)
+    for start in range(0, flat.numel(), int(chunk)):
+        end = min(start + int(chunk), flat.numel())
+        vals = flat[start:end].reshape(-1, 1)
+        idx = torch.argmin((vals - c).abs(), dim=1)
+        out[start:end] = c.reshape(-1)[idx]
+    return out.reshape_as(x)
+
+
+def _turboquant_scalar_reconstruct_v(
+    v: torch.Tensor,
+    *,
+    state: LayerTQState,
+    bits: int,
+    head_dim: int,
+    rotation_seed: int,
+    codebook_seed: int,
+    lloyd_iters: int,
+    max_codebook_samples: int,
+    codebook_fit_batch_limit: int,
+) -> torch.Tensor:
+    """
+    TurboQuant-style V compression probe:
+    rotate V -> scalar quantize with shared codebook -> inverse rotate.
+    No QJL residual is used, because QJL signs are designed for inner-product
+    estimation, not vector reconstruction.
+    """
+    if bits <= 0:
+        return v
+
+    device = v.device
+    if state.v_rotation is None:
+        state.v_rotation = make_random_orthogonal_rotation(
+            int(head_dim),
+            seed=int(rotation_seed) + 10000 + int(state.layer_idx),
+            device=device,
+        )
+
+    R = state.v_rotation
+    flat_v = v.reshape(-1, int(head_dim)).to(torch.float32)
+    rotated = torch.matmul(flat_v, R.T.to(torch.float32))
+
+    if state.v_centroids is None:
+        fit_rows = rotated
+        if int(codebook_fit_batch_limit) > 0 and fit_rows.shape[0] > int(codebook_fit_batch_limit):
+            fit_rows = fit_rows[: int(codebook_fit_batch_limit)]
+
+        state.v_centroids = fit_lloyd_scalar_codebook(
+            fit_rows.reshape(-1),
+            num_levels=1 << int(bits),
+            max_iters=int(lloyd_iters),
+            max_samples=int(max_codebook_samples),
+            seed=int(codebook_seed) + 10000 + int(state.layer_idx),
+        ).contiguous()
+        state.v_fit_calls += 1
+        if int(state.layer_idx) == 0:
+            print(
+                json.dumps(
+                    {
+                        "v_compress_first_fit": True,
+                        "mode": f"tq_scalar{bits}",
+                        "layer_idx": int(state.layer_idx),
+                        "v_centroids_shape": list(state.v_centroids.shape),
+                        "v_centroids_min": float(state.v_centroids.min().item()),
+                        "v_centroids_max": float(state.v_centroids.max().item()),
+                    }
+                ),
+                flush=True,
+            )
+
+    qrot = _quantize_to_centroids_chunked(rotated, state.v_centroids)
+    recon = torch.matmul(qrot, R.to(torch.float32)).reshape_as(v)
+    return recon.to(v.dtype)
+
+
+
+def _turboquant_scalar_qjl_reconstruct_v(
+    v: torch.Tensor,
+    *,
+    state: LayerTQState,
+    bits: int,
+    qjl_dim: int,
+    head_dim: int,
+    rotation_seed: int,
+    sketch_seed: int,
+    codebook_seed: int,
+    lloyd_iters: int,
+    max_codebook_samples: int,
+    codebook_fit_batch_limit: int,
+) -> torch.Tensor:
+    """
+    TurboQuant-style V compression with QJL residual vector reconstruction.
+
+    This is a quality probe, not the final runtime path.
+
+    For K, QJL estimates q · residual_K.
+    For V, we need residual_V itself, so we use a sign-random-projection
+    reconstruction identity:
+
+      E[sign(g·r) g] = sqrt(2/pi) * r / ||r||,  g ~ N(0, I)
+
+    Therefore:
+      r ≈ ||r|| * sqrt(pi/2) * mean_j sign(g_j·r) g_j
+
+    Storage equivalent per token/head:
+      scalar codes: D * bits / 8
+      QJL signs:   qjl_dim / 8
+      residual norm: 4 bytes
+    """
+    if bits <= 0:
+        return v
+
+    device = v.device
+    if state.v_rotation is None:
+        state.v_rotation = make_random_orthogonal_rotation(
+            int(head_dim),
+            seed=int(rotation_seed) + 10000 + int(state.layer_idx),
+            device=device,
+        )
+
+    if state.v_qjl_sketch is None:
+        gen = torch.Generator(device=device)
+        gen.manual_seed(int(sketch_seed) + 10000 + int(state.layer_idx))
+        state.v_qjl_sketch = torch.randn(
+            int(head_dim),
+            int(qjl_dim),
+            device=device,
+            dtype=torch.float32,
+            generator=gen,
+        ).contiguous()
+
+    R = state.v_rotation
+    G = state.v_qjl_sketch
+
+    flat_v = v.reshape(-1, int(head_dim)).to(torch.float32)
+    rotated = torch.matmul(flat_v, R.T.to(torch.float32))
+
+    if state.v_centroids is None:
+        fit_rows = rotated
+        if int(codebook_fit_batch_limit) > 0 and fit_rows.shape[0] > int(codebook_fit_batch_limit):
+            fit_rows = fit_rows[: int(codebook_fit_batch_limit)]
+
+        state.v_centroids = fit_lloyd_scalar_codebook(
+            fit_rows.reshape(-1),
+            num_levels=1 << int(bits),
+            max_iters=int(lloyd_iters),
+            max_samples=int(max_codebook_samples),
+            seed=int(codebook_seed) + 10000 + int(state.layer_idx),
+        ).contiguous()
+        state.v_fit_calls += 1
+
+        if int(state.layer_idx) == 0:
+            print(
+                json.dumps(
+                    {
+                        "v_compress_first_fit": True,
+                        "mode": f"tq_scalar{bits}_qjl{qjl_dim}",
+                        "layer_idx": int(state.layer_idx),
+                        "v_centroids_shape": list(state.v_centroids.shape),
+                        "v_qjl_sketch_shape": list(G.shape),
+                        "v_centroids_min": float(state.v_centroids.min().item()),
+                        "v_centroids_max": float(state.v_centroids.max().item()),
+                    }
+                ),
+                flush=True,
+            )
+
+    qrot = _quantize_to_centroids_chunked(rotated, state.v_centroids)
+    residual = rotated - qrot
+    norm = residual.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    # QJL sign reconstruction, chunked for memory.
+    out_residual = torch.empty_like(residual)
+    chunk = int(os.environ.get("TQ_V_QJL_RECON_CHUNK", str(1 << 15)))
+    scale = math.sqrt(math.pi / 2.0) / float(qjl_dim)
+
+    for start in range(0, residual.shape[0], chunk):
+        end = min(start + chunk, residual.shape[0])
+        r = residual[start:end]
+        n = norm[start:end]
+        signs = torch.where(torch.matmul(r, G) >= 0, 1.0, -1.0)
+        # ||r|| * sqrt(pi/2) * mean_j sign(g_j·r) g_j
+        out_residual[start:end] = (n * scale) * torch.matmul(signs, G.T)
+
+    recon_rot = qrot + out_residual
+    recon = torch.matmul(recon_rot, R.to(torch.float32)).reshape_as(v)
+    return recon.to(v.dtype)
+
+
+def _maybe_compress_v_for_quality_probe(
+    v: torch.Tensor,
+    *,
+    state: LayerTQState,
+    head_dim: int,
+    rotation_seed: int,
+    codebook_seed: int,
+    lloyd_iters: int,
+    max_codebook_samples: int,
+    codebook_fit_batch_limit: int,
+) -> torch.Tensor:
+    mode = os.environ.get("TQ_V_COMPRESS_MODE", "none").strip().lower()
+    if mode in {"", "none", "dense", "fp16"}:
+        return v
+
+    if mode in {"int8", "int8_token", "v_int8"}:
+        return _fake_quant_v_symmetric_per_token(v, bits=8)
+
+    if mode in {"int4", "int4_token", "v_int4"}:
+        return _fake_quant_v_symmetric_per_token(v, bits=4)
+
+    m = re.fullmatch(r"tq_scalar(\d+)_qjl(\d+)", mode)
+    if m is not None:
+        bits = int(m.group(1))
+        qjl_dim = int(m.group(2))
+        return _turboquant_scalar_qjl_reconstruct_v(
+            v,
+            state=state,
+            bits=bits,
+            qjl_dim=qjl_dim,
+            head_dim=head_dim,
+            rotation_seed=rotation_seed,
+            sketch_seed=int(os.environ.get("TQ_V_QJL_SKETCH_SEED", "909")),
+            codebook_seed=codebook_seed,
+            lloyd_iters=lloyd_iters,
+            max_codebook_samples=max_codebook_samples,
+            codebook_fit_batch_limit=codebook_fit_batch_limit,
+        )
+
+    if mode.startswith("tq_scalar"):
+        bits = int(mode.replace("tq_scalar", ""))
+        return _turboquant_scalar_reconstruct_v(
+            v,
+            state=state,
+            bits=bits,
+            head_dim=head_dim,
+            rotation_seed=rotation_seed,
+            codebook_seed=codebook_seed,
+            lloyd_iters=lloyd_iters,
+            max_codebook_samples=max_codebook_samples,
+            codebook_fit_batch_limit=codebook_fit_batch_limit,
+        )
+
+    raise RuntimeError(f"Unknown TQ_V_COMPRESS_MODE={mode!r}")
+
+
+
+def _fake_quant_k_symmetric_per_token(k: torch.Tensor, *, bits: int) -> torch.Tensor:
+    """
+    Per [B,H,T] symmetric fake quant over D for K.
+    This simulates storing K codes plus one scale per token/head.
+    """
+    if bits <= 0:
+        return k
+    qmax = (1 << (bits - 1)) - 1
+    if qmax <= 0:
+        qmax = 1
+    kf = k.to(torch.float32)
+    scale = kf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / float(qmax)
+    q = torch.round(kf / scale).clamp(-qmax, qmax)
+    recon = q * scale
+    return recon.to(k.dtype)
+
+
+def _maybe_compress_k_for_quality_probe(k: torch.Tensor) -> torch.Tensor:
+    mode = os.environ.get("TQ_K_COMPRESS_MODE", "tq_qjl").strip().lower()
+    if mode in {"", "none", "dense", "fp16"}:
+        return k
+    if mode in {"tq", "tq_qjl", "turboquant"}:
+        return k
+    if mode in {"int8", "int8_token", "k_int8"}:
+        return _fake_quant_k_symmetric_per_token(k, bits=8)
+    if mode in {"int4", "int4_token", "k_int4"}:
+        return _fake_quant_k_symmetric_per_token(k, bits=4)
+    raise RuntimeError(f"Unknown TQ_K_COMPRESS_MODE={mode!r}")
+
 
 
 class TurboQuantAttentionReplacement:
@@ -509,34 +813,61 @@ class TurboQuantAttentionReplacement:
 
             key_states = _repeat_kv(key_states, num_kv_groups)
             value_states = _repeat_kv(value_states, num_kv_groups)
+
+            # Optional V compression quality probe.
+            # This modifies only the value tensor used by the replacement attention path.
+            value_states = _maybe_compress_v_for_quality_probe(
+                value_states,
+                state=state,
+                head_dim=head_dim,
+                rotation_seed=self.rotation_seed,
+                codebook_seed=self.codebook_seed,
+                lloyd_iters=self.lloyd_iters,
+                max_codebook_samples=self.max_codebook_samples,
+                codebook_fit_batch_limit=self.codebook_fit_batch_limit,
+            )
+
             kv_len = int(key_states.shape[-2])
 
-            self._ensure_state(
-                state=state,
-                keys_for_fit=key_states,
-                head_dim=head_dim,
-            )
-
-            assert state.rotation is not None
-            assert state.sketch is not None
-            assert state.centroids is not None
-
-            encoding = encode_turboquant_prod_keys(
-                key_states,
-                rotation=state.rotation,
-                centroids=state.centroids,
-                sketch=state.sketch,
-            )
-            tq_logits = turboquant_prod_reference_logits(
-                query_states,
-                encoding,
-                rotation=state.rotation,
-                centroids=state.centroids,
-                sketch=state.sketch,
-            )
+            k_mode = os.environ.get("TQ_K_COMPRESS_MODE", "tq_qjl").strip().lower()
 
             scale = float(getattr(module, "scaling", 1.0 / math.sqrt(float(head_dim))))
-            attn_logits = tq_logits.to(torch.float32) * float(scale)
+
+            if k_mode in {"int8", "int8_token", "k_int8", "int4", "int4_token", "k_int4", "dense", "fp16", "none", ""}:
+                # K vector quantization probe:
+                # fake-quantize K, then compute dense qK^T logits.
+                # This tests whether simple vector quantization can replace TurboQuant+QJL for K.
+                k_for_logits = _maybe_compress_k_for_quality_probe(key_states)
+                tq_logits = torch.matmul(
+                    query_states.to(torch.float32),
+                    k_for_logits.transpose(-1, -2).to(torch.float32),
+                )
+                attn_logits = tq_logits * float(scale)
+            else:
+                self._ensure_state(
+                    state=state,
+                    keys_for_fit=key_states,
+                    head_dim=head_dim,
+                )
+
+                assert state.rotation is not None
+                assert state.sketch is not None
+                assert state.centroids is not None
+
+                encoding = encode_turboquant_prod_keys(
+                    key_states,
+                    rotation=state.rotation,
+                    centroids=state.centroids,
+                    sketch=state.sketch,
+                )
+                tq_logits = turboquant_prod_reference_logits(
+                    query_states,
+                    encoding,
+                    rotation=state.rotation,
+                    centroids=state.centroids,
+                    sketch=state.sketch,
+                )
+                attn_logits = tq_logits.to(torch.float32) * float(scale)
 
             attention_mask = kwargs.get("attention_mask", None)
             additive_mask = _normalize_attention_mask(
@@ -560,6 +891,8 @@ class TurboQuantAttentionReplacement:
                 "last_key_shape": list(key_states.shape),
                 "last_logits_shape": list(tq_logits.shape),
                 "last_scale": float(scale),
+                "k_compress_mode": os.environ.get("TQ_K_COMPRESS_MODE", "tq_qjl").strip().lower(),
+                "v_compress_mode": os.environ.get("TQ_V_COMPRESS_MODE", "none").strip().lower(),
             }
 
             return _replace_first_output(original_output, attn_output)
@@ -617,6 +950,9 @@ class TurboQuantAttentionReplacement:
                 "fit_calls": int(v.fit_calls),
                 "replace_calls": int(v.replace_calls),
                 "centroids_shape": list(v.centroids.shape) if v.centroids is not None else None,
+                "v_centroids_shape": list(v.v_centroids.shape) if v.v_centroids is not None else None,
+                "v_qjl_sketch_shape": list(v.v_qjl_sketch.shape) if v.v_qjl_sketch is not None else None,
+                "v_fit_calls": int(v.v_fit_calls),
                 "last_info": v.last_info,
             }
             for k, v in sorted(self.states.items(), key=lambda kv: kv[0])

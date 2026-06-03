@@ -82,6 +82,11 @@ from turboquant.turboquant_combined_reduction_nonfactor_qjl256_cuda import (
 )
 
 try:
+    from turboquant.quant_v_matmul_cuda import quant_v_matmul_cuda
+except Exception:
+    quant_v_matmul_cuda = None
+
+try:
     from transformers.models.llama.modeling_llama import apply_rotary_pos_emb as hf_apply_rotary_pos_emb
 except Exception:
     hf_apply_rotary_pos_emb = None
@@ -642,6 +647,100 @@ def _summary_ms(xs: list[float]) -> dict[str, Any]:
     }
 
 
+
+def _tq_value_cache_mode() -> str:
+    mode = os.environ.get("TQ_VALUE_CACHE_MODE", "dense").strip().lower()
+    aliases = {
+        "none": "dense",
+        "fp16": "dense",
+        "float16": "dense",
+        "int8": "int8_token",
+        "v_int8": "int8_token",
+        "int4": "int4_token",
+        "v_int4": "int4_token",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"dense", "int8_token", "int4_token"}:
+        raise RuntimeError(
+            "Invalid TQ_VALUE_CACHE_MODE. Expected dense, int8_token, or int4_token; "
+            f"got {mode!r}"
+        )
+    return mode
+
+
+def _tq_value_cache_bits_from_mode(mode: str) -> int:
+    if mode == "dense":
+        return 0
+    if mode == "int8_token":
+        return 8
+    if mode == "int4_token":
+        return 4
+    raise RuntimeError(f"Unsupported TQ_VALUE_CACHE_MODE={mode!r}")
+
+
+def _tq_quantize_v_symmetric_token(v: torch.Tensor, bits: int):
+    # v: [B, H, T, D]
+    if int(bits) <= 0:
+        return v.contiguous(), None
+
+    qmax = max((1 << (int(bits) - 1)) - 1, 1)
+    vf = v.detach().float()
+    scale = vf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / float(qmax)
+    q = torch.round(vf / scale).clamp(-qmax, qmax).to(torch.int8).contiguous()
+
+    # Note: int4_token currently stores signed int4 values in an int8 tensor.
+    # This is a decode-runtime prototype, not a packed int4 fused kernel.
+    return q, scale.to(torch.float16).contiguous()
+
+
+def _tq_dequantize_v_symmetric_token(q: torch.Tensor, scale: torch.Tensor | None, dtype: torch.dtype):
+    if scale is None:
+        return q.to(dtype)
+    return (q.float() * scale.float()).to(dtype)
+
+
+def _tq_values_obj_len(values_obj) -> int:
+    if isinstance(values_obj, tuple):
+        base_v, tail_v = values_obj
+        base_len = int(base_v.shape[-2])
+        tail_len = 0 if tail_v is None else int(tail_v.shape[-2])
+        return base_len + tail_len
+    return int(values_obj.shape[-2])
+
+
+def _tq_values_obj_slice(values_obj, start: int, end: int) -> torch.Tensor:
+    start = int(start)
+    end = int(end)
+    if end <= start:
+        raise RuntimeError(f"Invalid V slice: start={start}, end={end}")
+
+    if not isinstance(values_obj, tuple):
+        return values_obj[..., start:end, :].contiguous()
+
+    base_v, tail_v = values_obj
+    base_len = int(base_v.shape[-2])
+
+    chunks = []
+    if start < base_len:
+        chunks.append(base_v[..., start:min(end, base_len), :])
+
+    if tail_v is not None and end > base_len:
+        tail_start = max(0, start - base_len)
+        tail_end = end - base_len
+        chunks.append(tail_v[..., tail_start:tail_end, :])
+
+    if not chunks:
+        raise RuntimeError(
+            f"Could not slice V object: start={start}, end={end}, base_len={base_len}, "
+            f"tail_len={0 if tail_v is None else int(tail_v.shape[-2])}"
+        )
+
+    if len(chunks) == 1:
+        return chunks[0].contiguous()
+    return torch.cat(chunks, dim=-2).contiguous()
+
+
+
 def _try_call_nonfactor_kernel(
     *,
     rotated_queries: torch.Tensor,
@@ -883,6 +982,11 @@ class PackedLayerState:
     dense_value_storage: Optional[torch.Tensor] = None
     dense_cache_len: int = 0
     dense_cache_capacity: int = 0
+    value_q_storage: Optional[torch.Tensor] = None
+    value_scale_storage: Optional[torch.Tensor] = None
+    value_quant_cache_len: int = 0
+    value_quant_cache_capacity: int = 0
+    value_quant_mode: str = "dense"
     build_calls: int = 0
     append_calls: int = 0
     decode_calls: int = 0
@@ -1385,6 +1489,193 @@ class TurboQuantDecodeAttentionPatcher:
         past.value_cache[layer_i] = active_v
 
         return active_k, active_v, past
+
+    def _values_for_matmul_with_optional_quant_v(
+        self,
+        *,
+        state: PackedLayerState,
+        values_obj,
+        active_len: int,
+        dtype: torch.dtype,
+    ):
+        """
+        Optional quantized-V runtime path.
+
+        TQ_VALUE_CACHE_MODE=dense:
+            return dense values unchanged.
+
+        TQ_VALUE_CACHE_MODE=int8_token/int4_token:
+            maintain a per-layer quantized V cache and dequantize active V
+            before probs @ V.
+
+        This is intentionally a runtime prototype. The int4 mode stores signed
+        int4 values in int8 code tensors; packed int4 storage/fused matmul is a
+        later kernel-level optimization.
+        """
+        mode = _tq_value_cache_mode()
+        state.value_quant_mode = mode
+
+        if mode == "dense":
+            return values_obj
+
+        bits = _tq_value_cache_bits_from_mode(mode)
+        active_len = int(active_len)
+
+        if active_len <= 0:
+            return values_obj
+
+        current_len = int(getattr(state, "value_quant_cache_len", 0) or 0)
+
+        # Rebuild if cache is absent or shape went backwards.
+        if (
+            state.value_q_storage is None
+            or state.value_scale_storage is None
+            or current_len <= 0
+            or current_len > active_len
+        ):
+            dense_full = _tq_values_obj_slice(values_obj, 0, active_len)
+            q_full, s_full = _tq_quantize_v_symmetric_token(dense_full, bits)
+            state.value_q_storage = q_full
+            state.value_scale_storage = s_full
+            state.value_quant_cache_len = active_len
+            state.value_quant_cache_capacity = active_len
+
+            state.add_component_ms(f"value_cache_quant_install_{mode}", 0.0)
+
+        elif current_len < active_len:
+            dense_new = _tq_values_obj_slice(values_obj, current_len, active_len)
+            q_new, s_new = _tq_quantize_v_symmetric_token(dense_new, bits)
+
+            state.value_q_storage = torch.cat(
+                [state.value_q_storage, q_new],
+                dim=-2,
+            ).contiguous()
+            state.value_scale_storage = torch.cat(
+                [state.value_scale_storage, s_new],
+                dim=-2,
+            ).contiguous()
+            state.value_quant_cache_len = active_len
+            state.value_quant_cache_capacity = active_len
+
+            state.add_component_ms(f"value_cache_quant_append_{mode}", 0.0)
+
+        q_active = state.value_q_storage[..., :active_len, :]
+        s_active = state.value_scale_storage[..., :active_len, :]
+        return _tq_dequantize_v_symmetric_token(q_active, s_active, dtype)
+
+
+    def _ensure_quant_v_cache_for_active_len(
+        self,
+        *,
+        state: PackedLayerState,
+        values_obj,
+        active_len: int,
+    ) -> bool:
+        """
+        Maintain quantized V as a preallocated cache.
+
+        Critical optimization:
+          old path used torch.cat() on every decode step, which copies the
+          full [B,H,T,D] V-code cache repeatedly.
+
+          new path:
+            - install: allocate capacity >= active_len + reserve
+            - append: quantize only missing tail
+            - write q_new / s_new into preallocated slice
+            - grow only when capacity is exhausted
+        """
+        mode = _tq_value_cache_mode()
+        state.value_quant_mode = mode
+
+        if mode == "dense":
+            return False
+
+        bits = _tq_value_cache_bits_from_mode(mode)
+        active_len = int(active_len)
+        if active_len <= 0:
+            return True
+
+        reserve = int(
+            os.environ.get(
+                "TQ_VALUE_CACHE_RESERVE_TOKENS",
+                os.environ.get("TQ_COMPRESSED_CACHE_RESERVE_TOKENS", "256"),
+            )
+            or "256"
+        )
+        reserve = max(1, reserve)
+
+        current_len = int(getattr(state, "value_quant_cache_len", 0) or 0)
+        capacity = int(getattr(state, "value_quant_cache_capacity", 0) or 0)
+
+        def _alloc_like_q(q_src: torch.Tensor, cap: int) -> torch.Tensor:
+            shape = list(q_src.shape)
+            shape[-2] = int(cap)
+            return torch.empty(shape, device=q_src.device, dtype=q_src.dtype)
+
+        def _alloc_like_s(s_src: torch.Tensor, cap: int) -> torch.Tensor:
+            shape = list(s_src.shape)
+            shape[-2] = int(cap)
+            return torch.empty(shape, device=s_src.device, dtype=s_src.dtype)
+
+        # Full rebuild/install if cache is absent or length went backwards.
+        if (
+            state.value_q_storage is None
+            or state.value_scale_storage is None
+            or current_len <= 0
+            or current_len > active_len
+            or capacity < current_len
+        ):
+            dense_full = _tq_values_obj_slice(values_obj, 0, active_len)
+            q_full, s_full = _tq_quantize_v_symmetric_token(dense_full, bits)
+
+            new_capacity = max(active_len + reserve, int(active_len * 1.10) + reserve)
+
+            q_store = _alloc_like_q(q_full, new_capacity)
+            s_store = _alloc_like_s(s_full, new_capacity)
+
+            q_store[..., :active_len, :].copy_(q_full)
+            s_store[..., :active_len, :].copy_(s_full)
+
+            state.value_q_storage = q_store.contiguous()
+            state.value_scale_storage = s_store.contiguous()
+            state.value_quant_cache_len = active_len
+            state.value_quant_cache_capacity = int(new_capacity)
+
+            state.add_component_ms(f"value_cache_quant_install_prealloc_{mode}", 0.0)
+            return True
+
+        if current_len == active_len:
+            return True
+
+        # Quantize only the missing tail.
+        dense_new = _tq_values_obj_slice(values_obj, current_len, active_len)
+        q_new, s_new = _tq_quantize_v_symmetric_token(dense_new, bits)
+        new_len = active_len
+
+        # Grow capacity only when needed.
+        if new_len > capacity:
+            new_capacity = max(new_len + reserve, capacity * 2, 1)
+
+            q_store = _alloc_like_q(state.value_q_storage, new_capacity)
+            s_store = _alloc_like_s(state.value_scale_storage, new_capacity)
+
+            q_store[..., :current_len, :].copy_(state.value_q_storage[..., :current_len, :])
+            s_store[..., :current_len, :].copy_(state.value_scale_storage[..., :current_len, :])
+
+            state.value_q_storage = q_store.contiguous()
+            state.value_scale_storage = s_store.contiguous()
+            state.value_quant_cache_capacity = int(new_capacity)
+
+            state.add_component_ms(f"value_cache_quant_grow_{mode}", 0.0)
+
+        # Slice-write append. No torch.cat.
+        state.value_q_storage[..., current_len:new_len, :].copy_(q_new)
+        state.value_scale_storage[..., current_len:new_len, :].copy_(s_new)
+
+        state.value_quant_cache_len = int(new_len)
+        state.add_component_ms(f"value_cache_quant_append_prealloc_{mode}", 0.0)
+        return True
+
 
     def _active_compressed_cache_inputs(
         self,
@@ -2575,23 +2866,82 @@ class TurboQuantDecodeAttentionPatcher:
             )
             state.add_component_ms("post_logits_probs_cast_to_v_dtype", ms)
 
-            def _values_cast_only():
-                return _cast_values_to_dtype(full_values, attn_probs.dtype)
-
-            full_values_for_matmul, ms = _profile_cuda_ms(
-                patcher.profile_components,
-                _values_cast_only,
+            use_fused_quant_v = (
+                os.environ.get("TQ_ENABLE_FUSED_QUANT_V_MATMUL", "1").strip() != "0"
+                and _tq_value_cache_mode() in {"int8_token", "int4_token"}
+                and quant_v_matmul_cuda is not None
             )
-            state.add_component_ms("post_logits_values_cast_to_probs_dtype", ms)
 
-            def _matmul_probs_v_only():
-                return _matmul_probs_v_dynamic_tail(attn_probs, full_values_for_matmul)
+            if use_fused_quant_v:
+                # Important optimization:
+                # Do NOT materialize/cast full active dense V here.
+                # For quantized-V cache, full_values can be a dynamic_v_no_k
+                # object: either dense tensor or (base_v, tail_v).  We only
+                # slice the missing tail and quantize it inside
+                # _ensure_quant_v_cache_for_active_len().
+                def _quant_v_cache_prepare_only():
+                    ok = patcher._ensure_quant_v_cache_for_active_len(
+                        state=state,
+                        values_obj=full_values,
+                        active_len=int(attn_probs.shape[-1]),
+                    )
+                    if not ok:
+                        raise RuntimeError("Fused quant-V path requested but quant-V cache is not active.")
+                    return None
 
-            attn_output_heads, ms = _profile_cuda_ms(
-                patcher.profile_components,
-                _matmul_probs_v_only,
-            )
-            state.add_component_ms("post_logits_matmul_probs_v", ms)
+                _, ms = _profile_cuda_ms(
+                    patcher.profile_components,
+                    _quant_v_cache_prepare_only,
+                )
+                state.add_component_ms("post_logits_quant_v_cache_prepare", ms)
+
+                def _fused_quant_v_matmul_only():
+                    return quant_v_matmul_cuda(
+                        attn_probs.contiguous(),
+                        state.value_q_storage,
+                        state.value_scale_storage,
+                        int(attn_probs.shape[-1]),
+                        int(os.environ.get("TQ_FUSED_QUANT_V_CHUNK_SIZE", "256") or "256"),
+                    )
+
+                attn_output_heads, ms = _profile_cuda_ms(
+                    patcher.profile_components,
+                    _fused_quant_v_matmul_only,
+                )
+                state.add_component_ms("post_logits_fused_quant_v_matmul", ms)
+
+            else:
+                def _values_cast_only():
+                    return _cast_values_to_dtype(full_values, attn_probs.dtype)
+
+                dense_values_for_matmul, ms = _profile_cuda_ms(
+                    patcher.profile_components,
+                    _values_cast_only,
+                )
+                state.add_component_ms("post_logits_values_cast_to_probs_dtype", ms)
+
+                def _values_optional_quant_only():
+                    return patcher._values_for_matmul_with_optional_quant_v(
+                        state=state,
+                        values_obj=dense_values_for_matmul,
+                        active_len=int(attn_probs.shape[-1]),
+                        dtype=attn_probs.dtype,
+                    )
+
+                full_values_for_matmul, ms = _profile_cuda_ms(
+                    patcher.profile_components,
+                    _values_optional_quant_only,
+                )
+                state.add_component_ms("post_logits_optional_quant_v_prepare", ms)
+
+                def _matmul_probs_v_only():
+                    return _matmul_probs_v_dynamic_tail(attn_probs, full_values_for_matmul)
+
+                attn_output_heads, ms = _profile_cuda_ms(
+                    patcher.profile_components,
+                    _matmul_probs_v_only,
+                )
+                state.add_component_ms("post_logits_matmul_probs_v", ms)
 
             def _reshape_only():
                 return (
@@ -2716,6 +3066,10 @@ class TurboQuantDecodeAttentionPatcher:
                 "scalar_packed_shape": list(v.scalar_lane_words.shape) if v.scalar_lane_words is not None else None,
                 "qjl_packed_shape": list(v.qjl_lane_nibbles.shape) if v.qjl_lane_nibbles is not None else None,
                 "residual_norm_shape": list(v.residual_norms.shape) if v.residual_norms is not None else None,
+                "value_quant_mode": str(getattr(v, "value_quant_mode", "dense")),
+                "value_quant_cache_len": int(getattr(v, "value_quant_cache_len", 0) or 0),
+                "value_q_shape": list(v.value_q_storage.shape) if getattr(v, "value_q_storage", None) is not None else None,
+                "value_scale_shape": list(v.value_scale_storage.shape) if getattr(v, "value_scale_storage", None) is not None else None,
                 "component_ms_total": dict(v.component_ms_total),
                 "component_ms_count": dict(v.component_ms_count),
                 "component_ms_mean": {
