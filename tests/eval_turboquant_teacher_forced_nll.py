@@ -2293,7 +2293,7 @@ class TurboQuantDecodeAttentionPatcher:
                 dense_cache_mode = os.environ.get("TQ_DENSE_CACHE_MODE", "kv").strip().lower()
 
                 if (
-                    dense_cache_mode not in ("dynamic_v", "dynamic_v_no_k")
+                    dense_cache_mode not in ("dynamic_v", "dynamic_v_no_k", "dynamic_k_no_vtail")
                     and state.ready()
                     and hasattr(past, "key_cache")
                     and hasattr(past, "value_cache")
@@ -2306,6 +2306,31 @@ class TurboQuantDecodeAttentionPatcher:
                     )
                     if out is not None:
                         return out
+
+                if dense_cache_mode == "dynamic_k_no_vtail":
+                    # Fair V-tail baseline:
+                    # K path matches dynamic_v_no_k: dense K remains prefix-only and
+                    # generated K is appended only into compressed K.
+                    # V path remains dense-cat, so the only difference versus
+                    # dynamic_v_no_k is dense V cat vs V-tail no-cat.
+                    layer_i = int(state.layer_idx)
+                    if not hasattr(past, "value_cache"):
+                        raise RuntimeError("dynamic_k_no_vtail requires HF-style value_cache.")
+
+                    old_v = past.value_cache[layer_i]
+                    if old_v is None:
+                        active_v = value_states_new
+                    else:
+                        active_v = torch.cat([old_v, value_states_new], dim=-2)
+                    past.value_cache[layer_i] = active_v
+
+                    old_k = past.key_cache[layer_i]
+                    if old_k is None:
+                        full_keys_prefix = key_states_new[..., :0, :]
+                    else:
+                        full_keys_prefix = old_k
+
+                    return full_keys_prefix, active_v, past
 
                 if dense_cache_mode == "dynamic_v_no_k":
                     # Low-memory TurboQuant mode:
@@ -2328,12 +2353,68 @@ class TurboQuantDecodeAttentionPatcher:
                         raise RuntimeError("dynamic_v_no_k requires HF-style value_cache.")
 
                     old_v = past.value_cache[layer_i]
+
+                    # dynamic_v_no_k_tail_cache_no_cat:
+                    # Avoid materializing torch.cat([old_v, value_states_new])
+                    # during long-context decode. Keep the large prefill V as
+                    # base_v and accumulate only generated/teacher-forced V in
+                    # a small per-layer tail. The later probs @ V path handles
+                    # (base_v, tail_v) without concatenating.
                     if old_v is None:
                         active_v = value_states_new
+                        dynamic_v_tail = None
                     else:
-                        active_v = torch.cat([old_v, value_states_new], dim=-2)
+                        prev_tail = getattr(state, "dynamic_v_tail", None)
+                        if prev_tail is None:
+                            dynamic_v_tail = value_states_new
+                        else:
+                            dynamic_v_tail = torch.cat([prev_tail, value_states_new], dim=-2)
+                        setattr(state, "dynamic_v_tail", dynamic_v_tail)
+                        active_v = old_v
 
-                    past.value_cache[layer_i] = active_v
+
+                    if os.environ.get("TQ_DEBUG_VTAIL_DENSE_COMPARE", "").strip() == "1":
+                        # Debug-only dense reference. This intentionally materializes dense V,
+                        # so use only for short eval/debug, not 32k timing.
+                        debug_dense_v = getattr(state, "debug_dense_v", None)
+                        if debug_dense_v is None:
+                            if old_v is None:
+                                debug_dense_v = value_states_new
+                            else:
+                                debug_dense_v = torch.cat([old_v, value_states_new], dim=-2)
+                        else:
+                            debug_dense_v = torch.cat([debug_dense_v, value_states_new], dim=-2)
+                        setattr(state, "debug_dense_v", debug_dense_v)
+
+                        if old_v is not None:
+                            if dynamic_v_tail is None:
+                                recon_v = active_v
+                            else:
+                                recon_v = torch.cat([active_v, dynamic_v_tail], dim=-2)
+
+                            same_shape = list(debug_dense_v.shape) == list(recon_v.shape)
+                            if same_shape:
+                                diff = (debug_dense_v - recon_v).float().abs()
+                                max_abs = float(diff.max().item())
+                                mean_abs = float(diff.mean().item())
+                            else:
+                                max_abs = None
+                                mean_abs = None
+
+                            if int(state.layer_idx) == 0 and int(state.append_calls) < 8:
+                                print(
+                                    "[DEBUG vtail dense_compare]",
+                                    {
+                                        "layer": int(state.layer_idx),
+                                        "append_calls": int(state.append_calls),
+                                        "debug_dense_v": list(debug_dense_v.shape),
+                                        "recon_v": list(recon_v.shape),
+                                        "same_shape": same_shape,
+                                        "max_abs": max_abs,
+                                        "mean_abs": mean_abs,
+                                    },
+                                    flush=True,
+                                )
 
                     old_k = past.key_cache[layer_i]
                     if old_k is None:
@@ -2341,7 +2422,7 @@ class TurboQuantDecodeAttentionPatcher:
                     else:
                         full_keys_prefix = old_k
 
-                    return full_keys_prefix, active_v, past
+                    return full_keys_prefix, (active_v, dynamic_v_tail), past
 
                 return _cache_update(
                     module=self_module,
@@ -2365,7 +2446,7 @@ class TurboQuantDecodeAttentionPatcher:
             def _repeat_kv_states():
                 dense_cache_mode = os.environ.get("TQ_DENSE_CACHE_MODE", "kv").strip().lower()
 
-                if dense_cache_mode == "dynamic_v_no_k":
+                if dense_cache_mode in ("dynamic_v_no_k", "dynamic_k_no_vtail"):
                     # Low-memory long-context mode:
                     # - full_keys_kv is only needed for first compressed prefix build.
                     # - num_kv_groups is 1 for the current LLaMA config, so avoid an
@@ -2377,7 +2458,18 @@ class TurboQuantDecodeAttentionPatcher:
                     else:
                         full_keys_local = full_keys_kv
 
-                    full_values_local = _repeat_kv(full_values_kv, num_kv_groups).contiguous()
+                    if isinstance(full_values_kv, tuple):
+                        base_v, tail_v = full_values_kv
+                        if int(num_kv_groups) != 1:
+                            base_v = _repeat_kv(base_v, num_kv_groups).contiguous()
+                            if tail_v is not None:
+                                tail_v = _repeat_kv(tail_v, num_kv_groups).contiguous()
+                        full_values_local = (base_v, tail_v)
+                    else:
+                        if int(num_kv_groups) != 1:
+                            full_values_local = _repeat_kv(full_values_kv, num_kv_groups).contiguous()
+                        else:
+                            full_values_local = full_values_kv
                     new_keys_expanded_local = _repeat_kv(key_states_new, num_kv_groups).contiguous()
                     return full_keys_local, full_values_local, new_keys_expanded_local
 
@@ -2392,10 +2484,34 @@ class TurboQuantDecodeAttentionPatcher:
             )
             state.add_component_ms("repeat_kv_materialize", ms)
 
+            if (
+                os.environ.get("TQ_DEBUG_DUMP_NEW_KEYS", "").strip() == "1"
+                and int(state.layer_idx) == 0
+                and int(state.decode_calls) < int(os.environ.get("TQ_DEBUG_DUMP_STEPS", "4"))
+            ):
+                dump_dir = Path(os.environ.get("TQ_DEBUG_DUMP_NEW_KEYS_DIR", "runs/svd_uniform_08/eval/debug_new_keys"))
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                dump_path = dump_dir / (
+                    f"layer{int(state.layer_idx):02d}_"
+                    f"append{int(state.append_calls):05d}_"
+                    f"decode{int(state.decode_calls):05d}.pt"
+                )
+                torch.save(
+                    {
+                        "layer_idx": int(state.layer_idx),
+                        "append_calls": int(state.append_calls),
+                        "decode_calls": int(state.decode_calls),
+                        "full_keys_len": int(full_keys.shape[-2]),
+                        "new_keys_expanded": new_keys_expanded.detach().float().cpu(),
+                    },
+                    dump_path,
+                )
+                print("[DEBUG dump new_keys]", str(dump_path), flush=True)
+
             if not state.ready():
                 dense_cache_mode_for_install = os.environ.get("TQ_DENSE_CACHE_MODE", "kv").strip().lower()
                 if (
-                    dense_cache_mode_for_install not in ("dynamic_v", "dynamic_v_no_k")
+                    dense_cache_mode_for_install not in ("dynamic_v", "dynamic_v_no_k", "dynamic_k_no_vtail")
                     and hasattr(present, "key_cache")
                     and hasattr(present, "value_cache")
                     and state.dense_key_storage is None
@@ -2421,17 +2537,41 @@ class TurboQuantDecodeAttentionPatcher:
                 ):
                     return original_forward(*f_args, **f_kwargs)
 
+                dense_cache_mode_for_fit = os.environ.get("TQ_DENSE_CACHE_MODE", "kv").strip().lower()
+                fit_dynamic_v_no_k_with_current_k = (
+                    dense_cache_mode_for_fit == "dynamic_v_no_k"
+                    and os.environ.get("TQ_DEBUG_VTAIL_FIT_WITH_CURRENT_K", "").strip() == "1"
+                )
+                if fit_dynamic_v_no_k_with_current_k:
+                    # Debug-only parity path:
+                    # match normal path's initial compressed-K build, which sees prefix+current K.
+                    # This materializes a temporary K cat and is NOT for 32k timing.
+                    full_keys_for_fit = torch.cat([full_keys, new_keys_expanded], dim=-2)
+                    if int(state.layer_idx) == 0:
+                        print(
+                            "[DEBUG fit_with_current_k]",
+                            {
+                                "layer": int(state.layer_idx),
+                                "full_keys": list(full_keys.shape),
+                                "new_keys_expanded": list(new_keys_expanded.shape),
+                                "full_keys_for_fit": list(full_keys_for_fit.shape),
+                            },
+                            flush=True,
+                        )
+                else:
+                    full_keys_for_fit = full_keys
+
                 _, ms = _profile_cuda_ms(
                     patcher.profile_components,
                     lambda: patcher._fit_state_from_full_k(
                         state=state,
-                        full_keys=full_keys,
+                        full_keys=full_keys_for_fit,
                         head_dim=head_dim,
                     ),
                 )
                 state.add_component_ms("prime_build_full_prefix_state", ms)
 
-                if os.environ.get("TQ_DENSE_CACHE_MODE", "kv").strip().lower() == "dynamic_v_no_k":
+                if os.environ.get("TQ_DENSE_CACHE_MODE", "kv").strip().lower() in ("dynamic_v_no_k", "dynamic_k_no_vtail") and not fit_dynamic_v_no_k_with_current_k:
                     # prime_build_dynamic_v_no_k_append_current:
                     # The low-memory cache update returned only prefix dense K
                     # to avoid key_cache torch.cat. Append the current token K
@@ -2507,14 +2647,98 @@ class TurboQuantDecodeAttentionPatcher:
             state.add_component_ms("turboquant_cuda_logits_kernel_wrapper", ms)
             state.kernel_adapter = adapter
 
+            if (
+                os.environ.get("TQ_DEBUG_DUMP_TQ_LOGITS", "").strip() == "1"
+                and int(state.layer_idx) == 0
+                and int(state.append_calls) < int(os.environ.get("TQ_DEBUG_DUMP_STEPS", "4"))
+            ):
+                dump_dir = Path(os.environ.get("TQ_DEBUG_DUMP_DIR", "runs/svd_uniform_08/eval/debug_logits_dumps"))
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                dump_path = dump_dir / (
+                    f"layer{int(state.layer_idx):02d}_"
+                    f"append{int(state.append_calls):05d}_"
+                    f"decode{int(state.decode_calls):05d}.pt"
+                )
+                torch.save(
+                    {
+                        "layer_idx": int(state.layer_idx),
+                        "append_calls": int(state.append_calls),
+                        "decode_calls": int(state.decode_calls),
+                        "active_kv_len": int(active_kv_len),
+                        "full_keys_len": int(full_keys.shape[-2]),
+                        "tq_logits": tq_logits.detach().float().cpu(),
+                        "attn_logits": attn_logits.detach().float().cpu() if "attn_logits" in locals() else None,
+                    },
+                    dump_path,
+                )
+                print("[DEBUG dump tq_logits]", str(dump_path), flush=True)
+
+            if (
+                os.environ.get("TQ_DEBUG_KLOGITS", "").strip() == "1"
+                and int(state.layer_idx) == 0
+                and int(state.append_calls) < 8
+            ):
+                def _shape_or_none(x):
+                    try:
+                        return list(x.shape)
+                    except Exception:
+                        return None
+
+                print(
+                    "[DEBUG klogits]",
+                    {
+                        "layer": int(state.layer_idx),
+                        "append_calls": int(state.append_calls),
+                        "decode_calls": int(state.decode_calls),
+                        "active_kv_len": int(active_kv_len),
+                        "full_keys_len": int(full_keys.shape[-2]),
+                        "new_keys_expanded": _shape_or_none(new_keys_expanded),
+                        "tq_logits": list(tq_logits.shape),
+                        "scalar_lane_words": _shape_or_none(state.scalar_lane_words),
+                        "qjl_lane_nibbles": _shape_or_none(state.qjl_lane_nibbles),
+                        "residual_norms": _shape_or_none(state.residual_norms),
+                        "last_kv_len": int(getattr(state, "last_kv_len", -1)),
+                    },
+                    flush=True,
+                )
+
             scale = float(getattr(self_module, "scaling", 1.0 / math.sqrt(float(head_dim))))
             attn_logits = tq_logits.to(torch.float32) * float(scale)
 
             def _mask_build_only():
+                dense_cache_mode_for_mask = os.environ.get("TQ_DENSE_CACHE_MODE", "kv").strip().lower()
+                if dense_cache_mode_for_mask in ("dynamic_v_no_k", "dynamic_k_no_vtail"):
+                    # In dynamic_v_no_k, dense full_keys is prefix-only and does not
+                    # include generated/teacher-forced K tail. The logits kernel uses
+                    # compressed K with active_kv_len, so the attention mask must match
+                    # logits length, not dense full_keys.shape[-2].
+                    mask_kv_len = int(active_kv_len)
+                else:
+                    mask_kv_len = int(full_keys.shape[-2])
+
+                if (
+                    os.environ.get("TQ_DEBUG_KLOGITS", "").strip() == "1"
+                    and int(state.layer_idx) == 0
+                    and int(state.append_calls) < 8
+                ):
+                    print(
+                        "[DEBUG mask_kv_len]",
+                        {
+                            "layer": int(state.layer_idx),
+                            "append_calls": int(state.append_calls),
+                            "mode": dense_cache_mode_for_mask,
+                            "mask_kv_len": int(mask_kv_len),
+                            "active_kv_len": int(active_kv_len),
+                            "full_keys_len": int(full_keys.shape[-2]),
+                            "attn_logits_len": int(attn_logits.shape[-1]),
+                        },
+                        flush=True,
+                    )
+
                 return _normalize_mask(
                     kwargs.get("attention_mask", None),
                     q_len=q_len,
-                    kv_len=int(full_keys.shape[-2]),
+                    kv_len=mask_kv_len,
                     dtype=attn_logits.dtype,
                     device=attn_logits.device,
                 )
@@ -2600,8 +2824,107 @@ class TurboQuantDecodeAttentionPatcher:
                     flush=True,
                 )
 
+            def _value_dtype(values_obj):
+                if isinstance(values_obj, tuple):
+                    base_v, _tail_v = values_obj
+                    return base_v.dtype
+                return values_obj.dtype
+
+            def _cast_values_to_dtype(values_obj, dtype):
+                if isinstance(values_obj, tuple):
+                    base_v, tail_v = values_obj
+                    base_v = base_v.to(dtype)
+                    if tail_v is not None:
+                        tail_v = tail_v.to(dtype)
+                    return base_v, tail_v
+                return values_obj.to(dtype)
+
+            def _matmul_probs_v_dynamic_tail(attn_probs_local, values_obj):
+                if isinstance(values_obj, tuple):
+                    base_v, tail_v = values_obj
+
+                    if (
+                        os.environ.get("TQ_DEBUG_VTAIL_SHAPES", "").strip() == "1"
+                        and int(state.layer_idx) == 0
+                        and int(state.append_calls) < 8
+                    ):
+                        base_len_dbg = int(base_v.shape[-2])
+                        tail_len_dbg = 0 if tail_v is None else int(tail_v.shape[-2])
+                        probs_len_dbg = int(attn_probs_local.shape[-1])
+                        print(
+                            "[DEBUG vtail matmul]",
+                            {
+                                "layer": int(state.layer_idx),
+                                "append_calls": int(state.append_calls),
+                                "attn_probs": list(attn_probs_local.shape),
+                                "base_v": list(base_v.shape),
+                                "tail_v": None if tail_v is None else list(tail_v.shape),
+                                "base_len": base_len_dbg,
+                                "tail_len": tail_len_dbg,
+                                "sum_len": base_len_dbg + tail_len_dbg,
+                                "probs_len": probs_len_dbg,
+                                "ok": probs_len_dbg == base_len_dbg + tail_len_dbg,
+                            },
+                            flush=True,
+                        )
+
+                    base_len = int(base_v.shape[-2])
+                    out = torch.matmul(attn_probs_local[..., :base_len], base_v)
+
+                    if tail_v is not None and int(tail_v.shape[-2]) > 0:
+                        tail_len = int(tail_v.shape[-2])
+                        out = out + torch.matmul(
+                            attn_probs_local[..., base_len:base_len + tail_len],
+                            tail_v,
+                        )
+
+                    if (
+                        os.environ.get("TQ_DEBUG_VTAIL_PARITY", "").strip() == "1"
+                        and int(state.layer_idx) == 0
+                        and int(state.append_calls) < 6
+                        and tail_v is not None
+                    ):
+                        ref_v = torch.cat([base_v, tail_v], dim=-2)
+                        ref = torch.matmul(attn_probs_local, ref_v)
+                        diff = (out - ref).float().abs()
+                        print(
+                            "[DEBUG vtail parity]",
+                            {
+                                "layer": int(state.layer_idx),
+                                "append_calls": int(state.append_calls),
+                                "out_shape": list(out.shape),
+                                "ref_shape": list(ref.shape),
+                                "max_abs": float(diff.max().item()),
+                                "mean_abs": float(diff.mean().item()),
+                                "out_norm": float(out.float().norm().item()),
+                                "ref_norm": float(ref.float().norm().item()),
+                            },
+                            flush=True,
+                        )
+
+                    return out
+
+                return torch.matmul(attn_probs_local, values_obj)
+
+            if (
+                os.environ.get("TQ_DEBUG_VTAIL_SHAPES", "").strip() == "1"
+                and int(state.layer_idx) == 0
+                and int(state.append_calls) < 8
+            ):
+                print(
+                    "[DEBUG full_values type]",
+                    {
+                        "layer": int(state.layer_idx),
+                        "append_calls": int(state.append_calls),
+                        "type": type(full_values).__name__,
+                        "is_tuple": isinstance(full_values, tuple),
+                        "shape": None if isinstance(full_values, tuple) else list(full_values.shape),
+                    },
+                    flush=True,
+                )
+
             def _probs_cast_only():
-                return attn_probs_fp32.to(full_values.dtype)
+                return attn_probs_fp32.to(_value_dtype(full_values))
 
             attn_probs, ms = _profile_cuda_ms(
                 patcher.profile_components,
@@ -2610,7 +2933,7 @@ class TurboQuantDecodeAttentionPatcher:
             state.add_component_ms("post_logits_probs_cast_to_v_dtype", ms)
 
             def _values_cast_only():
-                return full_values.to(attn_probs.dtype)
+                return _cast_values_to_dtype(full_values, attn_probs.dtype)
 
             full_values_for_matmul, ms = _profile_cuda_ms(
                 patcher.profile_components,
@@ -2619,7 +2942,7 @@ class TurboQuantDecodeAttentionPatcher:
             state.add_component_ms("post_logits_values_cast_to_probs_dtype", ms)
 
             def _matmul_probs_v_only():
-                return torch.matmul(attn_probs, full_values_for_matmul)
+                return _matmul_probs_v_dynamic_tail(attn_probs, full_values_for_matmul)
 
             attn_output_heads, ms = _profile_cuda_ms(
                 patcher.profile_components,
@@ -3510,14 +3833,14 @@ def main() -> None:
             "patcher_summary": {},
             "latency_comparison": {
                 "baseline_mean_ms_per_token": (
-                    float(baseline["decode_ms_per_token"]["mean_ms"])
+                    float(baseline["decode_step_ms"]["mean_ms"])
                     if baseline is not None else None
                 ),
                 "replacement_mean_ms_per_token": None,
                 "replacement_over_baseline": None,
                 "baseline_over_replacement_speedup": None,
                 "baseline_tokens_per_sec": (
-                    baseline["tokens_per_sec"] if baseline is not None else None
+                    (float(1000.0 / baseline["decode_step_ms"]["mean_ms"]) if baseline is not None and float(baseline["decode_step_ms"]["mean_ms"]) > 0 else None)
                 ),
                 "replacement_tokens_per_sec": None,
             },

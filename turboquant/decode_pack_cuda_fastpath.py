@@ -426,73 +426,78 @@ torch::Tensor scalar_quantize_16_cuda(torch::Tensor values, torch::Tensor centro
 
 
 
+
 template <typename key_t>
 __global__ void fused_append_compressed_k_kernel(
     const key_t* __restrict__ new_keys,       // [B,H,1,128], contiguous, B=1
     const float* __restrict__ centroids,      // [16]
     const float* __restrict__ rotation,       // [128,128]
-    const float* __restrict__ sketch,         // [128,128]
+    const float* __restrict__ sketch,         // [qjl_dim,128]
     uint8_t* __restrict__ scalar_storage,     // [1,H,capacity,64]
-    uint8_t* __restrict__ qjl_storage,        // [1,H,capacity,16]
+    uint8_t* __restrict__ qjl_storage,        // [1,H,capacity,qjl_dim/8]
     float* __restrict__ norm_storage,         // [1,H,capacity]
     int64_t H,
     int64_t capacity,
-    int64_t start) {
+    int64_t start,
+    int64_t qjl_dim,
+    int64_t qjl_packed_dim) {
   const int h = static_cast<int>(blockIdx.x);
   const int tid = static_cast<int>(threadIdx.x);
 
-  if (h >= H || tid >= 128) return;
+  if (h >= H || tid >= qjl_dim) return;
 
   __shared__ float recon_rot[128];
   __shared__ float residual[128];
-  __shared__ float reduce_buf[128];
+  __shared__ float reduce_buf[512];
   __shared__ uint8_t codes_s[128];
-  __shared__ int8_t signs_s[128];
+  __shared__ uint8_t qjl_bits[512];
 
-  // new_keys row offset for B=1,T=1: [H,128]
   const int64_t key_base = static_cast<int64_t>(h) * 128;
 
-  // rotate(x) = x @ R.T
-  float z_d = 0.0f;
-  #pragma unroll
-  for (int j = 0; j < 128; ++j) {
-    const float x_j = static_cast<float>(new_keys[key_base + j]);
-    z_d += x_j * rotation[tid * 128 + j];
-  }
-
-  // scalar quantize 16 centroids
-  float best_dist = fabsf(z_d - centroids[0]);
-  int best = 0;
-  #pragma unroll
-  for (int k = 1; k < 16; ++k) {
-    const float dist = fabsf(z_d - centroids[k]);
-    if (dist < best_dist) {
-      best_dist = dist;
-      best = k;
+  if (tid < 128) {
+    float z_d = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 128; ++j) {
+      const float x_j = static_cast<float>(new_keys[key_base + j]);
+      z_d += x_j * rotation[tid * 128 + j];
     }
-  }
 
-  codes_s[tid] = static_cast<uint8_t>(best);
-  recon_rot[tid] = centroids[best];
+    float best_dist = fabsf(z_d - centroids[0]);
+    int best = 0;
+
+    #pragma unroll
+    for (int k = 1; k < 16; ++k) {
+      const float dist = fabsf(z_d - centroids[k]);
+      if (dist < best_dist) {
+        best_dist = dist;
+        best = k;
+      }
+    }
+
+    codes_s[tid] = static_cast<uint8_t>(best);
+    recon_rot[tid] = centroids[best];
+  }
 
   __syncthreads();
 
-  // inverse rotate reconstructed key: recon = recon_rot @ R
-  float recon_d = 0.0f;
-  #pragma unroll
-  for (int j = 0; j < 128; ++j) {
-    recon_d += recon_rot[j] * rotation[j * 128 + tid];
-  }
+  if (tid < 128) {
+    float recon_d = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 128; ++j) {
+      recon_d += recon_rot[j] * rotation[j * 128 + tid];
+    }
 
-  const float x_d = static_cast<float>(new_keys[key_base + tid]);
-  const float r_d = x_d - recon_d;
-  residual[tid] = r_d;
-  reduce_buf[tid] = r_d * r_d;
+    const float x_d = static_cast<float>(new_keys[key_base + tid]);
+    const float r_d = x_d - recon_d;
+    residual[tid] = r_d;
+    reduce_buf[tid] = r_d * r_d;
+  } else {
+    reduce_buf[tid] = 0.0f;
+  }
 
   __syncthreads();
 
-  // norm reduce
-  for (int offset = 64; offset > 0; offset >>= 1) {
+  for (int offset = static_cast<int>(qjl_dim) / 2; offset > 0; offset >>= 1) {
     if (tid < offset) {
       reduce_buf[tid] += reduce_buf[tid + offset];
     }
@@ -503,71 +508,59 @@ __global__ void fused_append_compressed_k_kernel(
     norm_storage[static_cast<int64_t>(h) * capacity + start] = sqrtf(reduce_buf[0]);
   }
 
-  // QJL sign projection
-  float dot = 0.0f;
-  #pragma unroll
-  for (int d = 0; d < 128; ++d) {
-    dot += residual[d] * sketch[tid * 128 + d];
+  // Match fused_scalar_quant_pack_4bit_kernel / pack_scalar_codes_lane_word_4bit:
+  // for lane in [0,31]:
+  //   packed[2*lane+0] = code[lane]    | code[lane+32] << 4
+  //   packed[2*lane+1] = code[lane+64] | code[lane+96] << 4
+  if (tid < 32) {
+    const uint8_t c0 = static_cast<uint8_t>(codes_s[tid] & 0x0F);
+    const uint8_t c1 = static_cast<uint8_t>(codes_s[tid + 32] & 0x0F);
+    const uint8_t c2 = static_cast<uint8_t>(codes_s[tid + 64] & 0x0F);
+    const uint8_t c3 = static_cast<uint8_t>(codes_s[tid + 96] & 0x0F);
+
+    scalar_storage[
+      (static_cast<int64_t>(h) * capacity + start) * 64 + 2 * tid + 0
+    ] = static_cast<uint8_t>(c0 | (c1 << 4));
+
+    scalar_storage[
+      (static_cast<int64_t>(h) * capacity + start) * 64 + 2 * tid + 1
+    ] = static_cast<uint8_t>(c2 | (c3 << 4));
   }
-  signs_s[tid] = (dot >= 0.0f) ? static_cast<int8_t>(1) : static_cast<int8_t>(-1);
+
+  if (tid < qjl_dim) {
+    float dot = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < 128; ++d) {
+      dot += residual[d] * sketch[tid * 128 + d];
+    }
+    qjl_bits[tid] = (dot > 0.0f) ? 1 : 0;
+  }
 
   __syncthreads();
 
-  // Pack scalar codes using the same lane layout as
-  // pack_scalar_codes_4bit_kernel(mode=0):
-  //
-  // byte j packs codes[lo_local] in low nibble and codes[hi_local] in high nibble
-  // j=0  -> (0,16)
-  // j=1  -> (64,80)
-  // j=2  -> (1,17)
-  // j=3  -> (65,81)
-  // ...
-  if (tid < 64) {
-    const int j = tid;
-    const int group = j / 32;       // 0 or 1
-    const int within = j % 32;
-    const int i = within / 2;       // 0..15
-    const int half = within % 2;    // 0 or 1
-
-    const int lo_local = group * 32 + i + half * 64;
-    const int hi_local = lo_local + 16;
-
-    const uint8_t a = static_cast<uint8_t>(codes_s[lo_local] & 0x0F);
-    const uint8_t b = static_cast<uint8_t>(codes_s[hi_local] & 0x0F);
-    const uint8_t packed = static_cast<uint8_t>(a | (b << 4));
-
-    scalar_storage[
-      (static_cast<int64_t>(h) * capacity + start) * 64 + tid
-    ] = packed;
-  }
-
-  // Pack QJL signs using the same lane-nibble layout as
-  // pack_qjl_signs_1bit_kernel(mode=0).
-  //
-  // Current fastpath mode=0 means nonzero -> 1. Since signs_s is {-1,+1},
-  // all sign values are nonzero and therefore map to bit 1, matching the
-  // existing pack_qjl fastpath behavior.
-  if (tid < 16) {
-    const int j = tid;
+  if (tid < qjl_packed_dim) {
+    const int block_id = tid / 16;
+    const int j = tid % 16;
+    const int base = block_id * 128;
     const int even = 2 * j;
     const int odd = 2 * j + 1;
 
     uint8_t packed = 0;
 
-    packed |= static_cast<uint8_t>((signs_s[even] != 0) << 0);
-    packed |= static_cast<uint8_t>((signs_s[odd]  != 0) << 4);
+    packed |= static_cast<uint8_t>(qjl_bits[base + even] << 0);
+    packed |= static_cast<uint8_t>(qjl_bits[base + odd]  << 4);
 
-    packed |= static_cast<uint8_t>((signs_s[32 + even] != 0) << 1);
-    packed |= static_cast<uint8_t>((signs_s[32 + odd]  != 0) << 5);
+    packed |= static_cast<uint8_t>(qjl_bits[base + 32 + even] << 1);
+    packed |= static_cast<uint8_t>(qjl_bits[base + 32 + odd]  << 5);
 
-    packed |= static_cast<uint8_t>((signs_s[64 + even] != 0) << 2);
-    packed |= static_cast<uint8_t>((signs_s[64 + odd]  != 0) << 6);
+    packed |= static_cast<uint8_t>(qjl_bits[base + 64 + even] << 2);
+    packed |= static_cast<uint8_t>(qjl_bits[base + 64 + odd]  << 6);
 
-    packed |= static_cast<uint8_t>((signs_s[96 + even] != 0) << 3);
-    packed |= static_cast<uint8_t>((signs_s[96 + odd]  != 0) << 7);
+    packed |= static_cast<uint8_t>(qjl_bits[base + 96 + even] << 3);
+    packed |= static_cast<uint8_t>(qjl_bits[base + 96 + odd]  << 7);
 
     qjl_storage[
-      (static_cast<int64_t>(h) * capacity + start) * 16 + tid
+      (static_cast<int64_t>(h) * capacity + start) * qjl_packed_dim + tid
     ] = packed;
   }
 }
@@ -603,15 +596,21 @@ void fused_append_compressed_k_cuda(
   TORCH_CHECK(new_keys.size(3) == 128, "new_keys last dim must be 128");
 
   TORCH_CHECK(scalar_storage.dim() == 4, "scalar_storage must be [1,H,capacity,64]");
-  TORCH_CHECK(qjl_storage.dim() == 4, "qjl_storage must be [1,H,capacity,16]");
+  TORCH_CHECK(qjl_storage.dim() == 4, "qjl_storage must be [1,H,capacity,qjl_dim/8]");
   TORCH_CHECK(norm_storage.dim() == 3, "norm_storage must be [1,H,capacity]");
+
+  TORCH_CHECK(sketch.dim() == 2 && sketch.size(1) == 128, "sketch must be [qjl_dim,128]");
+  const int64_t qjl_dim = sketch.size(0);
+  TORCH_CHECK(qjl_dim == 128 || qjl_dim == 256 || qjl_dim == 512,
+              "fused_append_compressed_k_cuda expects qjl_dim in {128,256,512}");
+  const int64_t qjl_packed_dim = qjl_dim / 8;
 
   const int64_t H = new_keys.size(1);
   const int64_t capacity = scalar_storage.size(2);
 
   TORCH_CHECK(scalar_storage.size(0) == 1 && scalar_storage.size(1) == H && scalar_storage.size(3) == 64,
               "bad scalar_storage shape");
-  TORCH_CHECK(qjl_storage.size(0) == 1 && qjl_storage.size(1) == H && qjl_storage.size(2) == capacity && qjl_storage.size(3) == 16,
+  TORCH_CHECK(qjl_storage.size(0) == 1 && qjl_storage.size(1) == H && qjl_storage.size(2) == capacity && qjl_storage.size(3) == qjl_packed_dim,
               "bad qjl_storage shape");
   TORCH_CHECK(norm_storage.size(0) == 1 && norm_storage.size(1) == H && norm_storage.size(2) == capacity,
               "bad norm_storage shape");
@@ -627,7 +626,7 @@ void fused_append_compressed_k_cuda(
   cudaStream_t stream = at::cuda::getDefaultCUDAStream().stream();
 
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(new_keys.scalar_type(), "fused_append_compressed_k_cuda", [&] {
-    fused_append_compressed_k_kernel<scalar_t><<<static_cast<unsigned int>(H), 128, 0, stream>>>(
+    fused_append_compressed_k_kernel<scalar_t><<<static_cast<unsigned int>(H), static_cast<unsigned int>(qjl_dim), 0, stream>>>(
         new_keys.data_ptr<scalar_t>(),
         centroids.data_ptr<float>(),
         rotation.data_ptr<float>(),
@@ -637,10 +636,11 @@ void fused_append_compressed_k_cuda(
         norm_storage.data_ptr<float>(),
         H,
         capacity,
-        start);
+        start,
+        qjl_dim,
+        qjl_packed_dim);
   });
 }
-
 
 template <typename key_t>
 __global__ void fused_rotate_quant_residual_qjl_kernel(
